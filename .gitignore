@@ -69,3 +69,10 @@ __recovery/
 plan/
 sample code/
 sample data/
+
+# Build output directories
+Win64/
+Win32/
+
+# Claude Code agent memory
+.claude/

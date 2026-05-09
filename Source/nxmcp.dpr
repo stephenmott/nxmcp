@@ -52,6 +52,7 @@ uses
   // Phase 6 - Transactions
   nxmcp.Tool.BatchExecute in 'nxmcp.Tool.BatchExecute.pas',
   // Phase 7 - Utility
+  nxmcp.Tool.ListTables in 'nxmcp.Tool.ListTables.pas',
   nxmcp.Tool.CountRecords in 'nxmcp.Tool.CountRecords.pas',
   nxmcp.Tool.ListIndexes in 'nxmcp.Tool.ListIndexes.pas',
   nxmcp.Tool.ExplainQuery in 'nxmcp.Tool.ExplainQuery.pas',
