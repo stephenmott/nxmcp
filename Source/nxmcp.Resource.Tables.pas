@@ -73,12 +73,16 @@ var
 begin
   Result := TTablesListData.Create;
   try
-    if Assigned(nxmodule) and nxmodule.IsConnected then
+    if Assigned(nxmodule) and nxmodule.EnsureConnection then
     begin
-      // Query system table for table list
-      nxmodule.nxQuery1.Close;
-      nxmodule.nxQuery1.SQL.Text := 'SELECT * FROM #tables';
-      nxmodule.nxQuery1.Open;
+      // Query system table for table list (auto-reconnects and retries once on lost connection)
+      nxmodule.ExecuteWithReconnect(
+        procedure
+        begin
+          nxmodule.nxQuery1.Close;
+          nxmodule.nxQuery1.SQL.Text := 'SELECT * FROM #tables';
+          nxmodule.nxQuery1.Open;
+        end);
       try
         // Find the tableName field (case-insensitive search)
         LField := nil;

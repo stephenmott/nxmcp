@@ -1,18 +1,14 @@
-unit nxmcp.Tool.GetTableSchema;
+﻿unit nxmcp.Tool.GetTableSchema;
 
 interface
 
 uses
   System.SysUtils,
   System.JSON,
-  System.Generics.Collections,
   MCPServer.Types,
   MCPServer.Tool.Base;
 
 type
-  /// <summary>
-  /// Parameters for the get_table_schema tool
-  /// </summary>
   TGetTableSchemaParams = class
   private
     FTableName: string;
@@ -21,9 +17,6 @@ type
     property TableName: string read FTableName write FTableName;
   end;
 
-  /// <summary>
-  /// MCP Tool that returns detailed schema information for a table
-  /// </summary>
   TGetTableSchemaTool = class(TMCPToolBase<TGetTableSchemaParams>)
   protected
     function ExecuteWithParams(const Params: TGetTableSchemaParams): string; override;
@@ -34,9 +27,17 @@ type
 implementation
 
 uses
-  Data.DB,
+  System.Variants,
+  nxsdTypes,
+  nxsdDataDictionary,
+  nxsdDataDictionaryAudit,
+  nxsdDataDictionaryDataPolicies,
+  nxsdDataDictionaryRefInt,
+  nxsdDataDictionaryStrings,
+  nxllException,
   MCPServer.Registration,
-  dmnx;
+  dmnx,
+  nxmcp.FieldTypes;
 
 { TGetTableSchemaTool }
 
@@ -45,154 +46,298 @@ begin
   inherited;
   FName := 'get_table_schema';
   FTitle := 'Get Table Schema';
-  FDescription := 'Get detailed schema information for a specific table including columns, data types, and indexes.';
+  FDescription := 'Get detailed schema information for a table from its data dictionary: columns (with descriptions, defaults, validators), indexes (with descriptions), table description, data policies, audit settings, and referential integrity references.';
+end;
+
+function VariantToJSONValue(const V: Variant): TJSONValue;
+begin
+  if VarIsNull(V) or VarIsEmpty(V) then
+    Result := TJSONNull.Create
+  else
+    Result := TJSONString.Create(VarToStr(V));
+end;
+
+function BuildDefaultJSON(const ADefault: TnxBaseDefaultValueDescriptor): TJSONObject;
+var
+  LObj: TJSONObject;
+  LApplyAt: string;
+begin
+  LObj := TJSONObject.Create;
+  LObj.AddPair('type', ADefault.ClassName);
+  if ADefault is TnxConstDefaultValueDescriptor then
+    LObj.AddPair('value', VariantToJSONValue(TnxConstDefaultValueDescriptor(ADefault).AsVariant));
+
+  if ADefault.ApplyAt = [aaClient] then
+    LApplyAt := 'client'
+  else if ADefault.ApplyAt = [aaServer] then
+    LApplyAt := 'server'
+  else if ADefault.ApplyAt = [aaClient, aaServer] then
+    LApplyAt := 'both'
+  else
+    LApplyAt := 'none';
+
+  LObj.AddPair('applyAt', LApplyAt);
+  LObj.AddPair('applyOnInsert', TJSONBool.Create(ADefault.ApplyOnInsert));
+  LObj.AddPair('applyOnModify', TJSONBool.Create(ADefault.ApplyOnModify));
+  LObj.AddPair('overwriteNonNull', TJSONBool.Create(ADefault.OverwriteNonNull));
+  Result := LObj;
+end;
+
+function BuildValidatorsJSON(const AField: TnxFieldDescriptor): TJSONArray;
+var
+  LArr: TJSONArray;
+  LObj: TJSONObject;
+  LMinMax: TnxMinMaxValidationDescriptor;
+  I: Integer;
+begin
+  LArr := TJSONArray.Create;
+  if not Assigned(AField.fdValidations) then
+    Exit(LArr);
+
+  for I := 0 to AField.fdValidations.ValidationCount - 1 do
+  begin
+    LObj := TJSONObject.Create;
+    LObj.AddPair('type', AField.fdValidations.ValidationDescriptor[I].ClassName);
+
+    if AField.fdValidations.ValidationDescriptor[I] is TnxMinMaxValidationDescriptor then
+    begin
+      LMinMax := TnxMinMaxValidationDescriptor(AField.fdValidations.ValidationDescriptor[I]);
+      LObj.AddPair('min', VariantToJSONValue(LMinMax.MinAsVariant));
+      LObj.AddPair('max', VariantToJSONValue(LMinMax.MaxAsVariant));
+    end;
+
+    LArr.AddElement(LObj);
+  end;
+  Result := LArr;
+end;
+
+function BuildDataPoliciesJSON(const ADict: TnxDataDictionary): TJSONObject;
+var
+  LDP: TnxDataPoliciesDescriptor;
+begin
+  LDP := GetDataPoliciesDescriptor(ADict);
+  if not Assigned(LDP) then
+    Exit(nil);
+
+  Result := TJSONObject.Create;
+  Result.AddPair('denyInsert', TJSONBool.Create(TnxRecordOperation.roInsert in LDP.DenyRecordOperations));
+  Result.AddPair('denyModify', TJSONBool.Create(TnxRecordOperation.roModify in LDP.DenyRecordOperations));
+  Result.AddPair('denyDelete', TJSONBool.Create(TnxRecordOperation.roDelete in LDP.DenyRecordOperations));
+  Result.AddPair('minRecordCount', TJSONNumber.Create(LDP.MinRecordCount));
+  Result.AddPair('maxRecordCount', TJSONNumber.Create(LDP.MaxRecordCount));
+end;
+
+function BuildAuditJSON(const ADict: TnxDataDictionary): TJSONObject;
+var
+  LIdx: Integer;
+  LAudit: TnxAuditDescriptor;
+begin
+  LIdx := ADict.CustomDescsDescriptor.GetCustomDescriptorFromName(csAuditDescriptorName);
+  if LIdx < 0 then
+    Exit(nil);
+
+  LAudit := ADict.CustomDescsDescriptor.CustomDescriptor[LIdx] as TnxAuditDescriptor;
+  Result := TJSONObject.Create;
+  Result.AddPair('useAudit', TJSONBool.Create(LAudit.UseAudit));
+  Result.AddPair('includeBlobFields', TJSONBool.Create(LAudit.IncludeBlobFields));
+end;
+
+type
+  TnxCrackIndexDescriptor = class(TnxIndexDescriptor);
+
+procedure DescribeTargetCursor(ACursor: TObject; out ATargetType, ATableName: string);
+begin
+  ATableName := '';
+  if ACursor is TnxTableTargetCursorDescriptor then
+  begin
+    ATargetType := 'Table';
+    ATableName := TnxTableTargetCursorDescriptor(ACursor).TableName;
+  end
+  else if ACursor is TnxRelativeTargetCursorDescriptor then
+  begin
+    ATargetType := 'Relative';
+    ATableName := TnxRelativeTargetCursorDescriptor(ACursor).TableName;
+  end
+  else if ACursor is TnxCloneTargetCursorDescriptor then
+    ATargetType := 'Clone'
+  else
+    ATargetType := ACursor.ClassName;
+end;
+
+function BuildReferencesJSON(const ADict: TnxDataDictionary): TJSONArray;
+var
+  LRI: TnxRefIntegrityDescriptor;
+  LRef: TnxReferenceDescriptor;
+  LRefObj: TJSONObject;
+  LSourcesArr: TJSONArray;
+  LSourceObj: TJSONObject;
+  LActionsArr: TJSONArray;
+  LFieldSource: TnxFieldSourceDescriptor;
+  LTargetType, LTableName, LFieldName: string;
+  I, J: Integer;
+begin
+  Result := TJSONArray.Create;
+
+  LRI := GetRefIntegrityDescriptor(ADict);
+  if not Assigned(LRI) then
+    Exit;
+
+  for I := 0 to LRI.ridReferenceCount - 1 do
+  begin
+    LRef := LRI.ridReferences[I];
+    LRefObj := TJSONObject.Create;
+
+    if Assigned(LRef.TargetCursor) then
+    begin
+      DescribeTargetCursor(LRef.TargetCursor, LTargetType, LTableName);
+      LRefObj.AddPair('targetType', LTargetType);
+      LRefObj.AddPair('targetTable', LTableName);
+    end;
+
+    LRefObj.AddPair('targetIndex', LRef.TargetIndex);
+
+    LSourcesArr := TJSONArray.Create;
+    for J := 0 to LRef.rdSourceCount - 1 do
+    begin
+      LFieldSource := TnxFieldSourceDescriptor(LRef.rdSources[J]);
+      LSourceObj := TJSONObject.Create;
+      if (LFieldSource.FieldNumber >= 0) and
+         (LFieldSource.FieldNumber < ADict.FieldsDescriptor.FieldCount) then
+        LFieldName := ADict.FieldsDescriptor.FieldDescriptor[LFieldSource.FieldNumber].Name
+      else
+        LFieldName := '';
+      LSourceObj.AddPair('fieldName', LFieldName);
+      LSourceObj.AddPair('skipOnNull', TJSONBool.Create(LFieldSource.SkipOnNull));
+      LSourcesArr.AddElement(LSourceObj);
+    end;
+    LRefObj.AddPair('sourceFields', LSourcesArr);
+
+    LActionsArr := TJSONArray.Create;
+    for J := 0 to LRef.rdActionCount - 1 do
+      LActionsArr.Add(LRef.rdActions[J].ClassName);
+    LRefObj.AddPair('actions', LActionsArr);
+
+    Result.AddElement(LRefObj);
+  end;
 end;
 
 function TGetTableSchemaTool.ExecuteWithParams(const Params: TGetTableSchemaParams): string;
 var
   LResultObj: TJSONObject;
-  LColumnsArray: TJSONArray;
-  LIndexesArray: TJSONArray;
-  LColumnObj: TJSONObject;
-  LIndexObj: TJSONObject;
+  LColumnsArray, LIndexesArray, LFieldsArr, LValidators, LRefs: TJSONArray;
+  LColumnObj, LIndexObj, LDefaultObj, LDP, LAudit: TJSONObject;
+  LDict: TnxDataDictionary;
+  LField: TnxFieldDescriptor;
+  LIndex: TnxIndexDescriptor;
+  LKey: TnxCompKeyDescriptor;
   LRecordCount: Integer;
-  LTableNameField: TField;
-  LFieldNameField: TField;
-  LIndexNameField: TField;
-  I: Integer;
-
-  function FindFieldByPatterns(const Patterns: array of string): TField;
-  var
-    J, K: Integer;
-  begin
-    Result := nil;
-    // First try FindField (case-insensitive)
-    for J := 0 to High(Patterns) do
-    begin
-      Result := nxmodule.nxQuery1.FindField(Patterns[J]);
-      if Result <> nil then
-        Exit;
-    end;
-    // Fallback: iterate through all fields
-    for K := 0 to nxmodule.nxQuery1.FieldCount - 1 do
-    begin
-      for J := 0 to High(Patterns) do
-      begin
-        if SameText(nxmodule.nxQuery1.Fields[K].FieldName, Patterns[J]) then
-        begin
-          Result := nxmodule.nxQuery1.Fields[K];
-          Exit;
-        end;
-      end;
-    end;
-  end;
-
+  I, J: Integer;
 begin
-  // Validate parameters
   if Trim(Params.TableName) = '' then
     raise Exception.Create('Table name cannot be empty');
 
-  // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
   LResultObj := TJSONObject.Create;
   try
     LResultObj.AddPair('tableName', Params.TableName);
 
-    // Get column information from #FIELDS system table
-    LColumnsArray := TJSONArray.Create;
-    LResultObj.AddPair('columns', LColumnsArray);
-
-    nxmodule.nxQuery1.Close;
-    nxmodule.nxQuery1.SQL.Text := 'SELECT * FROM "#FIELDS"';
-    nxmodule.nxQuery1.Open;
+    LDict := TnxDataDictionary.Create;
     try
-      // Find tableName field using multiple patterns
-      LTableNameField := FindFieldByPatterns(['tableName', 'TABLENAME', 'TABLE_NAME', 'Table_Name']);
-      // Fallback to field index 1 if not found (index 0 is usually tableIndex)
-      if LTableNameField = nil then
-        LTableNameField := nxmodule.nxQuery1.Fields[1];
-
-      while not nxmodule.nxQuery1.Eof do
-      begin
-        if SameText(LTableNameField.AsString, Params.TableName) then
+      nxmodule.ExecuteWithReconnect(
+        procedure
         begin
-          LColumnObj := TJSONObject.Create;
-          LFieldNameField := FindFieldByPatterns(['fieldName', 'FIELDNAME', 'FIELD_NAME']);
-          if LFieldNameField = nil then LFieldNameField := nxmodule.nxQuery1.Fields[3];
-          LColumnObj.AddPair('name', LFieldNameField.AsString);
+          nxCheck(nxmodule.nxDatabase1.GetDataDictionaryEx(
+            Params.TableName, nxmodule.TablePassword, LDict));
+        end);
 
-          LFieldNameField := FindFieldByPatterns(['fieldTypeSql', 'FIELDTYPESQL', 'FIELD_TYPE_SQL']);
-          if LFieldNameField <> nil then
-            LColumnObj.AddPair('typeSql', LFieldNameField.AsString);
+      // Table-level description
+      if LDict.FilesDescriptor.FileCount > 0 then
+        LResultObj.AddPair('description', LDict.FilesDescriptor.FileDescriptor[0].Desc);
 
-          LFieldNameField := FindFieldByPatterns(['fieldTypeNexus', 'FIELDTYPENEXUS', 'FIELD_TYPE_NEXUS']);
-          if LFieldNameField <> nil then
-            LColumnObj.AddPair('typeNexus', LFieldNameField.AsString);
+      // Columns
+      LColumnsArray := TJSONArray.Create;
+      LResultObj.AddPair('columns', LColumnsArray);
 
-          LFieldNameField := FindFieldByPatterns(['fieldLength', 'FIELDLENGTH', 'FIELD_LENGTH']);
-          if LFieldNameField <> nil then
-            LColumnObj.AddPair('length', TJSONNumber.Create(LFieldNameField.AsInteger));
+      for I := 0 to LDict.FieldsDescriptor.FieldCount - 1 do
+      begin
+        LField := LDict.FieldsDescriptor.FieldDescriptor[I];
+        LColumnObj := TJSONObject.Create;
+        LColumnObj.AddPair('name', LField.Name);
+        LColumnObj.AddPair('type', FieldTypeToString(LField.fdType));
+        LColumnObj.AddPair('units', TJSONNumber.Create(LField.fdUnits));
+        LColumnObj.AddPair('decimals', TJSONNumber.Create(LField.fdDecPl));
+        LColumnObj.AddPair('required', TJSONBool.Create(LField.fdRequired));
+        LColumnObj.AddPair('description', LField.fdDesc);
 
-          LFieldNameField := FindFieldByPatterns(['fieldUnits', 'FIELDUNITS', 'FIELD_UNITS']);
-          if LFieldNameField <> nil then
-            LColumnObj.AddPair('units', TJSONNumber.Create(LFieldNameField.AsInteger));
-
-          LFieldNameField := FindFieldByPatterns(['fieldDecimals', 'FIELDDECIMALS', 'FIELD_DECIMALS']);
-          if LFieldNameField <> nil then
-            LColumnObj.AddPair('decimals', TJSONNumber.Create(LFieldNameField.AsInteger));
-
-          LFieldNameField := FindFieldByPatterns(['fieldRequired', 'FIELDREQUIRED', 'FIELD_REQUIRED']);
-          if LFieldNameField <> nil then
-            LColumnObj.AddPair('required', TJSONBool.Create(LFieldNameField.AsBoolean));
-
-          LColumnsArray.AddElement(LColumnObj);
+        if Assigned(LField.fdDefaultValue) then
+        begin
+          LDefaultObj := BuildDefaultJSON(LField.fdDefaultValue);
+          LColumnObj.AddPair('default', LDefaultObj);
         end;
-        nxmodule.nxQuery1.Next;
+
+        LValidators := BuildValidatorsJSON(LField);
+        if LValidators.Count > 0 then
+          LColumnObj.AddPair('validators', LValidators)
+        else
+          LValidators.Free;
+
+        LColumnsArray.AddElement(LColumnObj);
       end;
-    finally
-      nxmodule.nxQuery1.Close;
-    end;
+      LResultObj.AddPair('columnCount', TJSONNumber.Create(LColumnsArray.Count));
 
-    LResultObj.AddPair('columnCount', TJSONNumber.Create(LColumnsArray.Count));
+      // Indexes
+      LIndexesArray := TJSONArray.Create;
+      LResultObj.AddPair('indexes', LIndexesArray);
 
-    // Get index information from #INDEXES system table
-    LIndexesArray := TJSONArray.Create;
-    LResultObj.AddPair('indexes', LIndexesArray);
-
-    nxmodule.nxQuery1.Close;
-    nxmodule.nxQuery1.SQL.Text := 'SELECT * FROM "#INDEXES"';
-    nxmodule.nxQuery1.Open;
-    try
-      LTableNameField := FindFieldByPatterns(['tableName', 'TABLENAME', 'TABLE_NAME', 'Table_Name']);
-      if LTableNameField = nil then
-        LTableNameField := nxmodule.nxQuery1.Fields[1];
-
-      while not nxmodule.nxQuery1.Eof do
+      if Assigned(LDict.IndicesDescriptor) then
       begin
-        if SameText(LTableNameField.AsString, Params.TableName) then
+        for I := 0 to LDict.IndicesDescriptor.IndexCount - 1 do
         begin
+          LIndex := LDict.IndicesDescriptor.IndexDescriptor[I];
           LIndexObj := TJSONObject.Create;
-          LIndexNameField := FindFieldByPatterns(['indexName', 'INDEXNAME', 'INDEX_NAME']);
-          if LIndexNameField = nil then LIndexNameField := nxmodule.nxQuery1.Fields[2];
-          LIndexObj.AddPair('name', LIndexNameField.AsString);
+          LIndexObj.AddPair('name', LIndex.Name);
+          LIndexObj.AddPair('unique', TJSONBool.Create(LIndex.Dups = idNone));
+          LIndexObj.AddPair('isDefault', TJSONBool.Create(LDict.IndicesDescriptor.DefaultIndex = LIndex.Number));
+          LIndexObj.AddPair('description', TnxCrackIndexDescriptor(LIndex).idDesc);
 
-          LFieldNameField := FindFieldByPatterns(['indexAllowsdups', 'INDEXALLOWSDUPS', 'INDEX_ALLOWS_DUPS']);
-          if LFieldNameField <> nil then
-            LIndexObj.AddPair('unique', TJSONBool.Create(SameText(LFieldNameField.AsString, 'NO')));
+          LFieldsArr := TJSONArray.Create;
+          if LIndex.KeyDescriptor is TnxCompKeyDescriptor then
+          begin
+            LKey := TnxCompKeyDescriptor(LIndex.KeyDescriptor);
+            for J := 0 to LKey.KeyFieldCount - 1 do
+              if LKey.KeyFields[J].FieldNumber >= 0 then
+                LFieldsArr.Add(LKey.KeyFields[J].Field.Name);
+          end;
+          LIndexObj.AddPair('fields', LFieldsArr);
 
           LIndexesArray.AddElement(LIndexObj);
         end;
-        nxmodule.nxQuery1.Next;
       end;
+      LResultObj.AddPair('indexCount', TJSONNumber.Create(LIndexesArray.Count));
+
+      // Data policies
+      LDP := BuildDataPoliciesJSON(LDict);
+      if Assigned(LDP) then
+        LResultObj.AddPair('dataPolicies', LDP);
+
+      // Audit
+      LAudit := BuildAuditJSON(LDict);
+      if Assigned(LAudit) then
+        LResultObj.AddPair('audit', LAudit);
+
+      // Referential integrity (read-only)
+      LRefs := BuildReferencesJSON(LDict);
+      if LRefs.Count > 0 then
+        LResultObj.AddPair('references', LRefs)
+      else
+        LRefs.Free;
     finally
-      nxmodule.nxQuery1.Close;
+      LDict.Free;
     end;
 
-    LResultObj.AddPair('indexCount', TJSONNumber.Create(LIndexesArray.Count));
-
-    // Get record count
+    // Record count (from SQL)
     nxmodule.nxQuery1.Close;
     nxmodule.nxQuery1.SQL.Text := 'SELECT COUNT(*) FROM "' + Params.TableName + '"';
     try
@@ -202,7 +347,6 @@ begin
       LRecordCount := -1;
     end;
     nxmodule.nxQuery1.Close;
-
     LResultObj.AddPair('recordCount', TJSONNumber.Create(LRecordCount));
 
     Result := LResultObj.ToJSON;

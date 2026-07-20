@@ -69,7 +69,7 @@ begin
     raise Exception.Create('SQL query cannot be empty');
 
   // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
   // Choose logging switch: #V+ for verbose, #L+ for standard
@@ -78,10 +78,14 @@ begin
   else
     LSwitch := '#L+';
 
-  // Execute query with logging enabled
-  nxmodule.nxQuery1.Close;
-  nxmodule.nxQuery1.SQL.Text := LSwitch + ' ' + Params.Sql;
-  nxmodule.nxQuery1.Open;
+  // Execute query with logging enabled (auto-reconnects and retries once on lost connection)
+  nxmodule.ExecuteWithReconnect(
+    procedure
+    begin
+      nxmodule.nxQuery1.Close;
+      nxmodule.nxQuery1.SQL.Text := LSwitch + ' ' + Params.Sql;
+      nxmodule.nxQuery1.Open;
+    end);
 
   try
     // Build result from Log property

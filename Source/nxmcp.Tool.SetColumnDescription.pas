@@ -1,4 +1,4 @@
-unit nxmcp.Tool.DropColumn;
+﻿unit nxmcp.Tool.SetColumnDescription;
 
 interface
 
@@ -9,27 +9,25 @@ uses
   MCPServer.Tool.Base;
 
 type
-  /// <summary>
-  /// Parameters for the drop_column tool
-  /// </summary>
-  TDropColumnParams = class
+  TSetColumnDescriptionParams = class
   private
     FTableName: string;
     FColumnName: string;
+    FDescription: string;
   public
     [SchemaDescription('Name of the table containing the column')]
     property TableName: string read FTableName write FTableName;
 
-    [SchemaDescription('Name of the column to remove')]
+    [SchemaDescription('Name of the column whose description to set')]
     property ColumnName: string read FColumnName write FColumnName;
+
+    [SchemaDescription('New description text. Pass an empty string to clear the description.')]
+    property Description: string read FDescription write FDescription;
   end;
 
-  /// <summary>
-  /// MCP Tool that removes a column from a table
-  /// </summary>
-  TDropColumnTool = class(TMCPToolBase<TDropColumnParams>)
+  TSetColumnDescriptionTool = class(TMCPToolBase<TSetColumnDescriptionParams>)
   protected
-    function ExecuteWithParams(const Params: TDropColumnParams): string; override;
+    function ExecuteWithParams(const Params: TSetColumnDescriptionParams): string; override;
   public
     constructor Create; override;
   end;
@@ -45,17 +43,17 @@ uses
   MCPServer.Registration,
   dmnx;
 
-{ TDropColumnTool }
+{ TSetColumnDescriptionTool }
 
-constructor TDropColumnTool.Create;
+constructor TSetColumnDescriptionTool.Create;
 begin
   inherited;
-  FName := 'drop_column';
-  FTitle := 'Drop Column';
-  FDescription := 'Remove a column from an existing table. WARNING: This permanently deletes the column and its data.';
+  FName := 'set_column_description';
+  FTitle := 'Set Column Description';
+  FDescription := 'Set or clear the description (comment) on a column. Pass an empty string to clear.';
 end;
 
-function TDropColumnTool.ExecuteWithParams(const Params: TDropColumnParams): string;
+function TSetColumnDescriptionTool.ExecuteWithParams(const Params: TSetColumnDescriptionParams): string;
 var
   LResultObj: TJSONObject;
   LOldDict, LNewDict: TnxDataDictionary;
@@ -65,44 +63,47 @@ var
   LTaskStatus: TnxTaskStatus;
   LFieldIdx: Integer;
 begin
-  // Validate parameters
   if Trim(Params.TableName) = '' then
     raise Exception.Create('Table name cannot be empty');
 
   if Trim(Params.ColumnName) = '' then
     raise Exception.Create('Column name cannot be empty');
 
-  // Check connection
   if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
-  // Close any open tables to avoid conflicts
   nxmodule.nxSession1.CloseInactiveTables;
 
   LOldDict := TnxDataDictionary.Create;
   try
-    // Get existing dictionary
     nxCheck(nxmodule.nxDatabase1.GetDataDictionaryEx(Params.TableName, nxmodule.TablePassword, LOldDict));
 
-    // Check if column exists
     LFieldIdx := LOldDict.FieldsDescriptor.GetFieldFromName(Params.ColumnName);
     if LFieldIdx < 0 then
       raise Exception.CreateFmt('Column "%s" not found in table "%s"', [Params.ColumnName, Params.TableName]);
 
-    // Create new dictionary without the column
     LNewDict := TnxDataDictionary.Create;
     try
       LNewDict.Assign(LOldDict);
 
-      // Remove the field
       LFieldIdx := LNewDict.FieldsDescriptor.GetFieldFromName(Params.ColumnName);
-      LNewDict.FieldsDescriptor.RemoveField(LFieldIdx);
+      LNewDict.FieldsDescriptor.FieldDescriptor[LFieldIdx].fdDesc := Params.Description;
 
-      // Check if restructure is needed
       if LOldDict.IsEqual(LNewDict) then
-        raise Exception.Create('No changes detected');
+      begin
+        LResultObj := TJSONObject.Create;
+        try
+          LResultObj.AddPair('success', TJSONBool.Create(True));
+          LResultObj.AddPair('tableName', Params.TableName);
+          LResultObj.AddPair('columnName', Params.ColumnName);
+          LResultObj.AddPair('noChange', TJSONBool.Create(True));
+          Result := LResultObj.ToJSON;
+          Exit;
+        finally
+          LResultObj.Free;
+        end;
+      end;
 
-      // Create mapper and restructure
       LMapper := TnxTableMapperDescriptor.Create;
       try
         LMapper.MapAllTablesAndFieldsByName(LOldDict, LNewDict);
@@ -110,7 +111,6 @@ begin
         nxCheck(nxmodule.nxDatabase1.RestructureTableEx(Params.TableName, nxmodule.TablePassword,
           LNewDict, LMapper, LTaskInfo));
 
-        // Wait for completion
         if Assigned(LTaskInfo) then
         try
           while True do
@@ -134,13 +134,12 @@ begin
     LOldDict.Free;
   end;
 
-  // Build result
   LResultObj := TJSONObject.Create;
   try
     LResultObj.AddPair('success', TJSONBool.Create(True));
     LResultObj.AddPair('tableName', Params.TableName);
     LResultObj.AddPair('columnName', Params.ColumnName);
-    LResultObj.AddPair('message', 'Column removed successfully');
+    LResultObj.AddPair('description', Params.Description);
     Result := LResultObj.ToJSON;
   finally
     LResultObj.Free;
@@ -148,10 +147,10 @@ begin
 end;
 
 initialization
-  TMCPRegistry.RegisterTool('drop_column',
+  TMCPRegistry.RegisterTool('set_column_description',
     function: IMCPTool
     begin
-      Result := TDropColumnTool.Create;
+      Result := TSetColumnDescriptionTool.Create;
     end
   );
 

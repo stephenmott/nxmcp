@@ -59,13 +59,17 @@ begin
     raise Exception.Create('Table name cannot be empty');
 
   // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
-  // Open table and get record count from metadata
-  nxmodule.nxTable1.Close;
-  nxmodule.nxTable1.TableName := Params.TableName;
-  nxmodule.nxTable1.Open;
+  // Open table and get record count from metadata (auto-reconnects and retries once on lost connection)
+  nxmodule.ExecuteWithReconnect(
+    procedure
+    begin
+      nxmodule.nxTable1.Close;
+      nxmodule.nxTable1.TableName := Params.TableName;
+      nxmodule.nxTable1.Open;
+    end);
   try
     LRecordCount := nxmodule.nxTable1.RecordCount;
   finally

@@ -16,12 +16,24 @@ type
   private
     FTableName: string;
     FColumns: string;
+    FDescription: string;
   public
     [SchemaDescription('Name of the table to create')]
     property TableName: string read FTableName write FTableName;
 
-    [SchemaDescription('JSON array of column definitions, e.g. [{"name": "ID", "type": "AutoInc"}, {"name": "Name", "type": "ShortString", "size": 50}]. Supported types: Boolean, Char, WideChar, Byte, Word, Word32, Int8, Int16, Integer, Int64, AutoInc, Single, Float, Extended, Currency, Date, Time, DateTime, Blob, Memo, Graphic, ByteArray, ShortString, NullString, WideString, RecRev, Guid, BCD, WideMemo, FmtBCD, RefNr')]
+    [SchemaDescription('JSON array of column definitions. Each object: {"name": "ID", "type": "AutoInc"}. ' +
+      'Optional per-column keys: "size" (int, for string types), "required" (bool, NOT NULL), ' +
+      '"description" (string), and "default" (object: {"type":"CurrentDateTime|CurrentUser|Constant|none", ' +
+      '"constantValue":"...", "applyAt":"client|server|both", "applyOnInsert":true, "applyOnModify":false, ' +
+      '"overwriteNonNull":false}). ' +
+      'Supported types: Boolean, Char, WideChar, Byte, Word, Word32, Int8, Int16, Integer, Int64, AutoInc, ' +
+      'Single, Float, Extended, Currency, Date, Time, DateTime, Blob, Memo, Graphic, ByteArray, ShortString, ' +
+      'NullString, WideString, RecRev, Guid, BCD, WideMemo, FmtBCD, RefNr')]
     property Columns: string read FColumns write FColumns;
+
+    [Optional]
+    [SchemaDescription('Optional description (comment) for the new table')]
+    property Description: string read FDescription write FDescription;
   end;
 
   /// <summary>
@@ -37,12 +49,17 @@ type
 implementation
 
 uses
+  System.Generics.Collections,
   Data.DB,
   nxsdTypes,
   nxsdDataDictionary,
+  nxsdTableMapperDescriptor,
+  nxsdServerEngine,
+  nxllException,
   MCPServer.Registration,
   dmnx,
-  nxmcp.FieldTypes;
+  nxmcp.FieldTypes,
+  nxmcp.ColumnSpec;
 
 { TCreateTableTool }
 
@@ -51,7 +68,63 @@ begin
   inherited;
   FName := 'create_table';
   FTitle := 'Create Table';
-  FDescription := 'Create a new table with the specified columns. Pass column definitions as a JSON array.';
+  FDescription := 'Create a new table with the specified columns. Each column may declare a type, size, ' +
+    'required (NOT NULL) flag, description, and a default value. Pass column definitions as a JSON array.';
+end;
+
+// Sets the table-level description via a restructure after the table exists,
+// since a fresh dictionary has no file descriptor until the table is created.
+procedure ApplyTableDescription(const ATableName, ADescription: string);
+var
+  LOldDict, LNewDict: TnxDataDictionary;
+  LMapper: TnxTableMapperDescriptor;
+  LTaskInfo: TnxAbstractTaskInfo;
+  LCompleted: Boolean;
+  LTaskStatus: TnxTaskStatus;
+begin
+  nxmodule.nxSession1.CloseInactiveTables;
+
+  LOldDict := TnxDataDictionary.Create;
+  try
+    nxCheck(nxmodule.nxDatabase1.GetDataDictionaryEx(ATableName, nxmodule.TablePassword, LOldDict));
+
+    LNewDict := TnxDataDictionary.Create;
+    try
+      LNewDict.Assign(LOldDict);
+      LNewDict.FilesDescriptor.FileDescriptor[0].Desc := ADescription;
+
+      if LOldDict.IsEqual(LNewDict) then
+        Exit;
+
+      LMapper := TnxTableMapperDescriptor.Create;
+      try
+        LMapper.MapAllTablesAndFieldsByName(LOldDict, LNewDict);
+
+        nxCheck(nxmodule.nxDatabase1.RestructureTableEx(ATableName, nxmodule.TablePassword,
+          LNewDict, LMapper, LTaskInfo));
+
+        if Assigned(LTaskInfo) then
+        try
+          while True do
+          begin
+            LTaskInfo.GetStatus(LCompleted, LTaskStatus);
+            if LCompleted then
+              Break;
+            Sleep(100);
+          end;
+          nxCheck(LTaskStatus.tsErrorCode);
+        finally
+          LTaskInfo.Free;
+        end;
+      finally
+        LMapper.Free;
+      end;
+    finally
+      LNewDict.Free;
+    end;
+  finally
+    LOldDict.Free;
+  end;
 end;
 
 function TCreateTableTool.ExecuteWithParams(const Params: TCreateTableParams): string;
@@ -63,6 +136,7 @@ var
   LColName, LColType: string;
   LColSize: Integer;
   LFieldType: TnxFieldType;
+  LField: TnxFieldDescriptor;
   I: Integer;
 begin
   // Validate parameters
@@ -82,7 +156,7 @@ begin
       raise Exception.Create('At least one column is required');
 
     // Check connection
-    if not Assigned(nxmodule) or not nxmodule.IsConnected then
+    if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
       raise Exception.Create('Not connected to NexusDB');
 
     // Create data dictionary
@@ -112,11 +186,25 @@ begin
           LColSize := StrToIntDef(LColObj.GetValue('size').Value, 0);
 
         // Add field to dictionary
-        LDict.FieldsDescriptor.AddField(LColName, '', LFieldType, LColSize, 0, False);
+        LField := LDict.FieldsDescriptor.AddField(LColName, '', LFieldType, LColSize, 0, False);
+
+        // Apply optional metadata: description, required, default
+        ApplyColumnMetadataFromJSON(LField, LColObj);
       end;
 
-      // Create the table
-      nxmodule.nxDatabase1.CreateTable(False, Params.TableName, '', LDict);
+      // Reconcile field setup/offsets after any required-flag changes
+      LDict.FieldsDescriptor.UpdateSetupAndOffsets;
+
+      // Create the table (auto-reconnects and retries once on lost connection)
+      nxmodule.ExecuteWithReconnect(
+        procedure
+        begin
+          nxmodule.nxDatabase1.CreateTable(False, Params.TableName, '', LDict);
+        end);
+
+      // Apply table-level description if requested (needs the table to exist)
+      if Trim(Params.Description) <> '' then
+        ApplyTableDescription(Params.TableName, Params.Description);
 
       // Build result
       LResultObj := TJSONObject.Create;

@@ -44,4 +44,16 @@ object nxmodule: Tnxmodule
     Left = 355
     Top = 246
   end
+  object nxServerEngine1: TnxServerEngine
+    ServerName = ''
+    SqlEngine = nxSqlEngine1
+    Options = []
+    TableExtension = 'nx1'
+    Left = 72
+    Top = 288
+  end
+  object nxSqlEngine1: TnxSqlEngine
+    Left = 200
+    Top = 288
+  end
 end

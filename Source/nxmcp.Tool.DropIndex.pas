@@ -62,16 +62,21 @@ begin
     raise Exception.Create('Index name cannot be empty');
 
   // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
   // Close any open tables to avoid conflicts
   nxmodule.nxSession1.CloseInactiveTables;
 
   // Drop index using SQL (NexusDB syntax: DROP INDEX tablename.indexname)
-  nxmodule.nxQuery1.Close;
-  nxmodule.nxQuery1.SQL.Text := 'DROP INDEX "' + Params.TableName + '"."' + Params.IndexName + '"';
-  nxmodule.nxQuery1.ExecSQL;
+  // Auto-reconnects and retries once on lost connection.
+  nxmodule.ExecuteWithReconnect(
+    procedure
+    begin
+      nxmodule.nxQuery1.Close;
+      nxmodule.nxQuery1.SQL.Text := 'DROP INDEX "' + Params.TableName + '"."' + Params.IndexName + '"';
+      nxmodule.nxQuery1.ExecSQL;
+    end);
 
   // Build result
   LResultObj := TJSONObject.Create;

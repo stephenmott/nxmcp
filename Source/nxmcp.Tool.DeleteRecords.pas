@@ -65,16 +65,21 @@ begin
     raise Exception.Create('WHERE clause is required to prevent accidental mass deletion');
 
   // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
   // Build DELETE SQL
   LSql := 'DELETE FROM "' + Params.TableName + '" WHERE ' + Params.WhereClause;
 
-  // Execute
-  nxmodule.nxQuery1.Close;
-  nxmodule.nxQuery1.SQL.Text := LSql;
-  nxmodule.nxQuery1.ExecSQL;
+  // Execute (auto-reconnects and retries once on lost connection;
+  // DELETE with the same WHERE clause is safe to repeat)
+  nxmodule.ExecuteWithReconnect(
+    procedure
+    begin
+      nxmodule.nxQuery1.Close;
+      nxmodule.nxQuery1.SQL.Text := LSql;
+      nxmodule.nxQuery1.ExecSQL;
+    end);
   LRowsAffected := nxmodule.nxQuery1.RowsAffected;
 
   // Build result

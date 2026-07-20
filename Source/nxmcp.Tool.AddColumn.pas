@@ -18,8 +18,11 @@ type
     FColumnName: string;
     FColumnType: string;
     FSize: Integer;
+    FRequired: Boolean;
+    FDescription: string;
     FDefaultValueType: string;
-    FApplyOnInsert: Boolean;
+    FConstantValue: string;
+    FApplyAt: string;
     FApplyOnModify: Boolean;
     FOverwriteNonNull: Boolean;
   public
@@ -37,15 +40,27 @@ type
     property Size: Integer read FSize write FSize;
 
     [Optional]
-    [SchemaDescription('Default value type: CurrentDateTime, CurrentUser (optional)')]
+    [SchemaDescription('Make the column required (NOT NULL). Default: false. Note: adding a required column to a table that already has records may fail unless a default is supplied.')]
+    property Required: Boolean read FRequired write FRequired;
+
+    [Optional]
+    [SchemaDescription('Optional description (comment) for the new column')]
+    property Description: string read FDescription write FDescription;
+
+    [Optional]
+    [SchemaDescription('Default value type: CurrentDateTime, CurrentUser, or Constant (optional). The default is applied on insert; use set_column_default for finer control.')]
     property DefaultValueType: string read FDefaultValueType write FDefaultValueType;
 
     [Optional]
-    [SchemaDescription('Apply default value on insert (default: true)')]
-    property ApplyOnInsert: Boolean read FApplyOnInsert write FApplyOnInsert;
+    [SchemaDescription('For Constant default: the literal value as a string, parsed against the field type. Required when defaultValueType=Constant.')]
+    property ConstantValue: string read FConstantValue write FConstantValue;
 
     [Optional]
-    [SchemaDescription('Apply default value on modify (default: true)')]
+    [SchemaDescription('Where the default is applied: client, server, or both. Default: both')]
+    property ApplyAt: string read FApplyAt write FApplyAt;
+
+    [Optional]
+    [SchemaDescription('Also apply the default value on modify/update (default: false)')]
     property ApplyOnModify: Boolean read FApplyOnModify write FApplyOnModify;
 
     [Optional]
@@ -73,7 +88,8 @@ uses
   nxllException,
   MCPServer.Registration,
   dmnx,
-  nxmcp.FieldTypes;
+  nxmcp.FieldTypes,
+  nxmcp.ColumnSpec;
 
 { TAddColumnTool }
 
@@ -82,7 +98,7 @@ begin
   inherited;
   FName := 'add_column';
   FTitle := 'Add Column';
-  FDescription := 'Add a new column to an existing table. Optionally set a default value type for automatic population.';
+  FDescription := 'Add a new column to an existing table. Optionally set required (NOT NULL), a description, and a default value.';
 end;
 
 function TAddColumnTool.ExecuteWithParams(const Params: TAddColumnParams): string;
@@ -94,8 +110,7 @@ var
   LCompleted: Boolean;
   LTaskStatus: TnxTaskStatus;
   LFieldType: TnxFieldType;
-  LFieldIdx: Integer;
-  LApplyOnInsert, LApplyOnModify: Boolean;
+  LField: TnxFieldDescriptor;
 begin
   // Validate parameters
   if Trim(Params.TableName) = '' then
@@ -110,7 +125,7 @@ begin
   LFieldType := StringToFieldType(Params.ColumnType);
 
   // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
   // Close any open tables to avoid conflicts
@@ -131,37 +146,22 @@ begin
       LNewDict.Assign(LOldDict);
 
       // Add the new field
-      LNewDict.FieldsDescriptor.AddField(Params.ColumnName, '', LFieldType, Params.Size, 0, False);
+      LField := LNewDict.FieldsDescriptor.AddField(Params.ColumnName, '', LFieldType, Params.Size, 0, False);
 
-      // Set default value if specified
+      // Description
+      if Trim(Params.Description) <> '' then
+        LField.fdDesc := Params.Description;
+
+      // Required (NOT NULL)
+      LField.fdRequired := Params.Required;
+
+      // Default value (applied on insert; modify/overwrite per params)
       if Trim(Params.DefaultValueType) <> '' then
-      begin
-        LFieldIdx := LNewDict.FieldsDescriptor.GetFieldFromName(Params.ColumnName);
-        if LFieldIdx >= 0 then
-        begin
-          // Determine default value settings
-          LApplyOnInsert := True;
-          LApplyOnModify := True;
-          if Params.ApplyOnInsert then LApplyOnInsert := Params.ApplyOnInsert;
-          if Params.ApplyOnModify then LApplyOnModify := Params.ApplyOnModify;
+        SetFieldDefault(LField, Params.DefaultValueType, Params.ConstantValue, Params.ApplyAt,
+          True, Params.ApplyOnModify, Params.OverwriteNonNull);
 
-          if SameText(Params.DefaultValueType, 'CurrentDateTime') then
-            LNewDict.FieldsDescriptor.FieldDescriptor[LFieldIdx].AddDefaultValue(TnxCurrentDateTimeDefaultValueDescriptor)
-          else if SameText(Params.DefaultValueType, 'CurrentUser') then
-            LNewDict.FieldsDescriptor.FieldDescriptor[LFieldIdx].AddDefaultValue(TnxCurrentUserDefaultValueDescriptor)
-          else
-            raise Exception.CreateFmt('Unknown default value type: %s', [Params.DefaultValueType]);
-
-          // Configure default value behavior
-          with LNewDict.FieldsDescriptor.FieldDescriptor[LFieldIdx].fdDefaultValue do
-          begin
-            ApplyAt := [aaServer, aaClient];
-            ApplyOnInsert := LApplyOnInsert;
-            ApplyOnModify := LApplyOnModify;
-            OverwriteNonNull := Params.OverwriteNonNull;
-          end;
-        end;
-      end;
+      // Reconcile setup/offsets after the required-flag change
+      LNewDict.FieldsDescriptor.UpdateSetupAndOffsets;
 
       // Check if restructure is needed
       if LOldDict.IsEqual(LNewDict) then
@@ -206,6 +206,7 @@ begin
     LResultObj.AddPair('tableName', Params.TableName);
     LResultObj.AddPair('columnName', Params.ColumnName);
     LResultObj.AddPair('columnType', Params.ColumnType);
+    LResultObj.AddPair('required', TJSONBool.Create(Params.Required));
     if Trim(Params.DefaultValueType) <> '' then
       LResultObj.AddPair('defaultValueType', Params.DefaultValueType);
     Result := LResultObj.ToJSON;

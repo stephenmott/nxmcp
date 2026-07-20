@@ -20,6 +20,7 @@ type
     FNewType: string;
     FNewSize: Integer;
     FNewName: string;
+    FRequired: string;
   public
     [SchemaDescription('Name of the table containing the column')]
     property TableName: string read FTableName write FTableName;
@@ -38,6 +39,10 @@ type
     [Optional]
     [SchemaDescription('New name for the column (optional, for renaming)')]
     property NewName: string read FNewName write FNewName;
+
+    [Optional]
+    [SchemaDescription('Set the required (NOT NULL) flag: "true" or "false". Leave empty to keep unchanged. Making a column required may fail if existing records hold null values.')]
+    property Required: string read FRequired write FRequired;
   end;
 
   /// <summary>
@@ -84,6 +89,9 @@ var
   LFieldIdx: Integer;
   LChanges: TStringList;
   LIsRename: Boolean;
+  LRequired: string;
+  LHasRequired: Boolean;
+  LRequiredValue: Boolean;
 begin
   // Validate parameters
   if Trim(Params.TableName) = '' then
@@ -92,12 +100,27 @@ begin
   if Trim(Params.ColumnName) = '' then
     raise Exception.Create('Column name cannot be empty');
 
+  // Parse the tri-state required flag ('', 'true', 'false')
+  LRequired := Trim(Params.Required);
+  LHasRequired := LRequired <> '';
+  if LHasRequired then
+  begin
+    if SameText(LRequired, 'true') then
+      LRequiredValue := True
+    else if SameText(LRequired, 'false') then
+      LRequiredValue := False
+    else
+      raise Exception.CreateFmt('Invalid required value "%s". Use "true", "false", or leave empty.', [Params.Required]);
+  end
+  else
+    LRequiredValue := False;
+
   // Check that at least one modification is specified
-  if (Trim(Params.NewType) = '') and (Params.NewSize = 0) and (Trim(Params.NewName) = '') then
-    raise Exception.Create('At least one modification (newType, newSize, or newName) must be specified');
+  if (Trim(Params.NewType) = '') and (Params.NewSize = 0) and (Trim(Params.NewName) = '') and (not LHasRequired) then
+    raise Exception.Create('At least one modification (newType, newSize, newName, or required) must be specified');
 
   // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
   // Close any open tables to avoid conflicts
@@ -139,8 +162,15 @@ begin
           LChanges.Add('size=' + IntToStr(Params.NewSize));
         end;
 
-        // Recalculate offsets after any type or size mutation
-        if (Trim(Params.NewType) <> '') or (Params.NewSize > 0) then
+        // Apply required (NOT NULL) change
+        if LHasRequired then
+        begin
+          LNewDict.FieldsDescriptor.FieldDescriptor[LFieldIdx].fdRequired := LRequiredValue;
+          LChanges.Add('required=' + BoolToStr(LRequiredValue, True));
+        end;
+
+        // Recalculate offsets after any type, size, or required mutation
+        if (Trim(Params.NewType) <> '') or (Params.NewSize > 0) or LHasRequired then
           LNewDict.FieldsDescriptor.UpdateSetupAndOffsets;
 
         // Apply rename

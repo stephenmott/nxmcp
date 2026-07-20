@@ -21,10 +21,14 @@ type
     [SchemaDescription('Name of the table to update')]
     property TableName: string read FTableName write FTableName;
 
-    [SchemaDescription('JSON string with column names as keys and new values, e.g. {"Name": "Updated", "Value": 456}')]
+    [SchemaDescription('JSON string with column names as keys and new values, e.g. {"Name": "Updated", "Value": 456}. ' +
+      'GUID, Date, Time and DateTime columns are handled automatically from plain strings: GUID (braces optional) e.g. "{1111...}"; ' +
+      'Date "YYYY-MM-DD"; Time "HH:MM:SS"; DateTime "YYYY-MM-DD HH:MM:SS" (ISO "T" separator and a trailing Z/offset are also accepted).')]
     property Data: string read FData write FData;
 
-    [SchemaDescription('WHERE clause without the WHERE keyword (e.g., "ID = 5" or "Status = ''Active''")')]
+    [SchemaDescription('WHERE clause without the WHERE keyword (e.g., "ID = 5" or "Status = ''Active''"). ' +
+      'NOTE: this clause is passed through verbatim, so to match a GUID/Date/Time/DateTime column use the typed literal, e.g. ' +
+      'RowGuid = GUID ''{1111...}'', D = DATE ''2024-01-15'', or DT = TIMESTAMP ''2024-01-15 13:45:00'' (a plain quoted string raises a type mismatch).')]
     property WhereClause: string read FWhereClause write FWhereClause;
   end;
 
@@ -42,8 +46,11 @@ implementation
 
 uses
   Data.DB,
+  System.Generics.Collections,
+  nxsdTypes,
   MCPServer.Registration,
-  dmnx;
+  dmnx,
+  nxmcp.ValueFormat;
 
 { TUpdateRecordsTool }
 
@@ -63,6 +70,7 @@ var
   LSetClause: string;
   LPair: TJSONPair;
   LRowsAffected: Integer;
+  LFieldTypes: TDictionary<string, TnxFieldType>;
 begin
   // Validate parameters
   if Trim(Params.TableName) = '' then
@@ -84,42 +92,45 @@ begin
       raise Exception.Create('Data object cannot be empty');
 
     // Check connection
-    if not Assigned(nxmodule) or not nxmodule.IsConnected then
+    if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
       raise Exception.Create('Not connected to NexusDB');
 
-    // Build SET clause
-    LSetClause := '';
+    // Look up column types so GUID (and other typed) columns are formatted
+    // correctly. Non-fatal: if the dictionary can't be read, fall back to
+    // plain literal formatting (old behaviour) rather than failing the update.
+    try
+      LFieldTypes := GetTableFieldTypes(Params.TableName);
+    except
+      LFieldTypes := nil;
+    end;
 
-    for LPair in LDataObj do
-    begin
-      if LSetClause <> '' then
-        LSetClause := LSetClause + ', ';
+    try
+      // Build SET clause
+      LSetClause := '';
 
-      LSetClause := LSetClause + '"' + LPair.JsonString.Value + '" = ';
-
-      // Format value based on type
-      if LPair.JsonValue is TJSONNull then
-        LSetClause := LSetClause + 'NULL'
-      else if LPair.JsonValue is TJSONNumber then
-        LSetClause := LSetClause + LPair.JsonValue.Value
-      else if LPair.JsonValue is TJSONBool then
+      for LPair in LDataObj do
       begin
-        if TJSONBool(LPair.JsonValue).AsBoolean then
-          LSetClause := LSetClause + 'TRUE'
-        else
-          LSetClause := LSetClause + 'FALSE';
-      end
-      else
-        // String value - escape single quotes
-        LSetClause := LSetClause + '''' + StringReplace(LPair.JsonValue.Value, '''', '''''', [rfReplaceAll]) + '''';
+        if LSetClause <> '' then
+          LSetClause := LSetClause + ', ';
+
+        LSetClause := LSetClause + '"' + LPair.JsonString.Value + '" = ' +
+          FormatJsonValueAsSql(LPair.JsonString.Value, LPair.JsonValue, LFieldTypes);
+      end;
+    finally
+      LFieldTypes.Free;
     end;
 
     LSql := 'UPDATE "' + Params.TableName + '" SET ' + LSetClause + ' WHERE ' + Params.WhereClause;
 
-    // Execute
-    nxmodule.nxQuery1.Close;
-    nxmodule.nxQuery1.SQL.Text := LSql;
-    nxmodule.nxQuery1.ExecSQL;
+    // Execute (auto-reconnects and retries once on lost connection;
+    // UPDATE with the same WHERE clause is generally safe to repeat)
+    nxmodule.ExecuteWithReconnect(
+      procedure
+      begin
+        nxmodule.nxQuery1.Close;
+        nxmodule.nxQuery1.SQL.Text := LSql;
+        nxmodule.nxQuery1.ExecSQL;
+      end);
     LRowsAffected := nxmodule.nxQuery1.RowsAffected;
 
     // Build result

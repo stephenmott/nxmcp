@@ -16,12 +16,22 @@ type
   private
     FStatements: string;
     FSnapshot: Boolean;
+    FLog: Boolean;
+    FVerboseLog: Boolean;
   public
     [SchemaDescription('JSON array of SQL statements to execute, e.g. ["SELECT * FROM...", "INSERT INTO...", "UPDATE..."]')]
     property Statements: string read FStatements write FStatements;
 
     [SchemaDescription('Use snapshot transaction for read consistency (default: false)')]
     property Snapshot: Boolean read FSnapshot write FSnapshot;
+
+    [Optional]
+    [SchemaDescription('Enable query log (#L+) to capture execution plan summary for each statement')]
+    property Log: Boolean read FLog write FLog;
+
+    [Optional]
+    [SchemaDescription('Enable verbose log (#V+) to capture full optimizer internals for each statement')]
+    property VerboseLog: Boolean read FVerboseLog write FVerboseLog;
   end;
 
   /// <summary>
@@ -38,9 +48,11 @@ type
 implementation
 
 uses
+  System.Generics.Collections,
   Data.DB,
   DataSet.Serialize,
   MCPServer.Registration,
+  nxmcp.SqlUtils,
   dmnx;
 
 { TBatchExecuteTool }
@@ -63,11 +75,13 @@ var
   LStatementsArray: TJSONArray;
   LStatementResult: TJSONObject;
   LStatement: string;
+  LSql: string;
   LSqlUpper: string;
   LRowsAffected: Integer;
   LTotalRowsAffected: Integer;
   LExecutedCount: Integer;
   LIsSelect: Boolean;
+  LHasLog: Boolean;
   LDataArray: TJSONArray;
   I: Integer;
   LTransactionStarted: Boolean;
@@ -77,7 +91,6 @@ begin
     raise Exception.Create('Statements array cannot be empty');
 
   // Parse JSON array of statements
-  LStatementsArray := nil;
   try
     LStatementsArray := TJSONObject.ParseJSONValue(Params.Statements) as TJSONArray;
   except
@@ -94,8 +107,10 @@ begin
     raise Exception.Create('Statements array cannot be empty');
   end;
 
-  // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  // Check connection (transparently reconnects if dropped).
+  // Note: comm-lost AFTER the transaction starts is intentionally not retried —
+  // the existing rollback path below surfaces a clean error to the caller.
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
   begin
     LStatementsArray.Free;
     raise Exception.Create('Not connected to NexusDB');
@@ -107,6 +122,10 @@ begin
   LExecutedCount := 0;
   LTransactionStarted := False;
 
+  // Determine if logging is requested. Set before the try so the except handler
+  // (which runs even if StartTransaction itself fails) never reads it uninitialized.
+  LHasLog := Params.VerboseLog or Params.Log;
+
   try
     try
       // Start transaction
@@ -117,11 +136,18 @@ begin
       for I := 0 to LStatementsArray.Count - 1 do
       begin
         LStatement := LStatementsArray.Items[I].Value;
-        LSqlUpper := LStatement.TrimLeft.ToUpper;
+        LSqlUpper := StripSwitches(LStatement).ToUpper;
         LIsSelect := LSqlUpper.StartsWith('SELECT');
 
+        // Prepend log switch if requested
+        LSql := LStatement;
+        if Params.VerboseLog then
+          LSql := '#V+ ' + LSql
+        else if Params.Log then
+          LSql := '#L+ ' + LSql;
+
         nxmodule.nxQuery1.Close;
-        nxmodule.nxQuery1.SQL.Text := LStatement;
+        nxmodule.nxQuery1.SQL.Text := LSql;
 
         // Record result for this statement
         LStatementResult := TJSONObject.Create;
@@ -136,6 +162,10 @@ begin
             LDataArray := nxmodule.nxQuery1.ToJSONArray;
             LStatementResult.AddPair('rowCount', TJSONNumber.Create(nxmodule.nxQuery1.RecordCount));
             LStatementResult.AddPair('data', LDataArray);
+
+            // Include log output if requested
+            if LHasLog then
+              LStatementResult.AddPair('log', LogToJSONArray(nxmodule.nxQuery1.Log));
           finally
             nxmodule.nxQuery1.Close;
           end;
@@ -147,6 +177,10 @@ begin
           LRowsAffected := nxmodule.nxQuery1.RowsAffected;
           LStatementResult.AddPair('rowsAffected', TJSONNumber.Create(LRowsAffected));
           Inc(LTotalRowsAffected, LRowsAffected);
+
+          // Include log output if requested
+          if LHasLog then
+            LStatementResult.AddPair('log', LogToJSONArray(nxmodule.nxQuery1.Log));
         end;
 
         LResultsArray.AddElement(LStatementResult);
@@ -189,6 +223,10 @@ begin
         LResultObj.AddPair('statementsExecutedBeforeError', TJSONNumber.Create(LExecutedCount));
         LResultObj.AddPair('failedAtIndex', TJSONNumber.Create(LExecutedCount));
         LResultObj.AddPair('error', E.Message);
+
+        // Include log output if requested (TnxQuery populates Log even on failure)
+        if LHasLog and (nxmodule.nxQuery1.Log.Count > 0) then
+          LResultObj.AddPair('log', LogToJSONArray(nxmodule.nxQuery1.Log));
 
         Result := LResultObj.ToJSON;
       end;

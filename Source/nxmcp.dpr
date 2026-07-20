@@ -1,5 +1,5 @@
-// JCL_DEBUG_EXPERT_GENERATEJDBG OFF
-// JCL_DEBUG_EXPERT_INSERTJDBG OFF
+﻿// JCL_DEBUG_EXPERT_GENERATEJDBG ON
+// JCL_DEBUG_EXPERT_INSERTJDBG ON
 program nxmcp;
 
 {$APPTYPE CONSOLE}
@@ -7,8 +7,16 @@ program nxmcp;
 {$R *.res}
 
 uses
+  //not all NexusDB SKUs have all of these nx... files. Comment out if not found
+  nxReplacementMemoryManager,
+  nxExceptionHook,
+  nxExeConst,
+  nxPatchPPL,
+  nxPatchBetterTypeCast,
+
   System.SysUtils,
   System.SyncObjs,
+  System.IniFiles,
   Winapi.Windows,
   MCPServer.Types,
   MCPServer.IdHTTPServer,
@@ -20,7 +28,12 @@ uses
   MCPServer.ToolsManager,
   MCPServer.ResourcesManager,
   dmnx in 'dmnx.pas' {nxmodule: TDataModule},
+  nxmcp.FileLog in 'nxmcp.FileLog.pas',
   nxmcp.FieldTypes in 'nxmcp.FieldTypes.pas',
+  nxmcp.ColumnSpec in 'nxmcp.ColumnSpec.pas',
+  nxmcp.SqlUtils in 'nxmcp.SqlUtils.pas',
+  nxmcp.ValueFormat in 'nxmcp.ValueFormat.pas',
+  nxmcp.QueryParams in 'nxmcp.QueryParams.pas',
   nxmcp.Resource.Server in 'nxmcp.Resource.Server.pas',
   nxmcp.Resource.Tables in 'nxmcp.Resource.Tables.pas',
   nxmcp.Resource.Schema in 'nxmcp.Resource.Schema.pas',
@@ -42,6 +55,14 @@ uses
   nxmcp.Tool.ModifyColumn in 'nxmcp.Tool.ModifyColumn.pas',
   nxmcp.Tool.CreateIndex in 'nxmcp.Tool.CreateIndex.pas',
   nxmcp.Tool.DropIndex in 'nxmcp.Tool.DropIndex.pas',
+  // Phase 4b - Schema Metadata
+  nxmcp.Tool.SetTableDescription in 'nxmcp.Tool.SetTableDescription.pas',
+  nxmcp.Tool.SetColumnDescription in 'nxmcp.Tool.SetColumnDescription.pas',
+  nxmcp.Tool.SetIndexDescription in 'nxmcp.Tool.SetIndexDescription.pas',
+  nxmcp.Tool.SetFieldValidator in 'nxmcp.Tool.SetFieldValidator.pas',
+  nxmcp.Tool.SetColumnDefault in 'nxmcp.Tool.SetColumnDefault.pas',
+  nxmcp.Tool.SetDataPolicies in 'nxmcp.Tool.SetDataPolicies.pas',
+  nxmcp.Tool.SetAudit in 'nxmcp.Tool.SetAudit.pas',
   // Phase 5 - Table Maintenance
   nxmcp.Tool.EmptyTable in 'nxmcp.Tool.EmptyTable.pas',
   nxmcp.Tool.PackTable in 'nxmcp.Tool.PackTable.pas',
@@ -59,7 +80,10 @@ uses
   // Phase 8 - Database Management
   nxmcp.Tool.ListAliases in 'nxmcp.Tool.ListAliases.pas',
   nxmcp.Tool.SwitchDatabase in 'nxmcp.Tool.SwitchDatabase.pas',
-  nxmcp.Tool.SwitchServer in 'nxmcp.Tool.SwitchServer.pas';
+  nxmcp.Tool.SwitchServer in 'nxmcp.Tool.SwitchServer.pas',
+  // Phase 9 - Configuration
+  nxmcp.Tool.SetTimeout in 'nxmcp.Tool.SetTimeout.pas',
+  nxmcp.Tool.GetQueryLog in 'nxmcp.Tool.GetQueryLog.pas';
 
 var
   Server: TMCPIdHTTPServer;
@@ -67,6 +91,7 @@ var
   ManagerRegistry: IMCPManagerRegistry;
   CoreManager: IMCPCapabilityManager;
   ShutdownEvent: TEvent;
+  UseStdio: Boolean;
 
 function ConsoleCtrlHandler(dwCtrlType: DWORD): BOOL; stdcall;
 begin
@@ -85,7 +110,7 @@ begin
   end;
 end;
 
-function HasStdioFlag: Boolean;
+function HasParam(const AFlag: string): Boolean;
 var
   I: Integer;
   Param: string;
@@ -94,7 +119,7 @@ begin
   for I := 1 to ParamCount do
   begin
     Param := ParamStr(I).ToLower;
-    if (Param = '--stdio') or (Param = '-stdio') or (Param = '/stdio') then
+    if (Param = '--' + AFlag) or (Param = '-' + AFlag) or (Param = '/' + AFlag) then
     begin
       Result := True;
       Break;
@@ -102,14 +127,63 @@ begin
   end;
 end;
 
+// Resolve the MCP transport. Precedence:
+//   1. Command-line flag: --stdio / --http (also -stdio, /stdio, ...) - always wins
+//   2. [Server] Transport in the .ini: "stdio" or "http"
+//   3. Default: HTTP (preserves historical behaviour)
+// Must be evaluated before any stdout output: in STDIO mode stdout is reserved
+// for JSON-RPC, so all logging has to be redirected to stderr first.
+function UseStdioTransport: Boolean;
+var
+  LIniPath: string;
+  LIniFile: TIniFile;
+  LTransport: string;
+begin
+  // 1. Explicit command-line flags override everything
+  if HasParam('stdio') then
+    Exit(True);
+  if HasParam('http') then
+    Exit(False);
+
+  // 2. [Server] Transport in the same .ini the DataModule uses
+  LIniPath := ChangeFileExt(ParamStr(0), '.ini');
+  if FileExists(LIniPath) then
+  begin
+    LIniFile := TIniFile.Create(LIniPath);
+    try
+      LTransport := Trim(LIniFile.ReadString('Server', 'Transport', '')).ToLower;
+    finally
+      LIniFile.Free;
+    end;
+    if LTransport = 'stdio' then
+      Exit(True);
+    if LTransport = 'http' then
+      Exit(False);
+  end;
+
+  // 3. Default
+  Result := False;
+end;
+
 procedure InitializeNexusDB;
+var
+  LTarget: string;
 begin
   TLogger.Info('Initializing NexusDB connection...');
   nxmodule := Tnxmodule.Create(nil);
 
   if nxmodule.IsConnected then
-    TLogger.Info('Connected to NexusDB: ' + nxmodule.AliasName +
-                 ' @ ' + nxmodule.ServerHost + ':' + IntToStr(nxmodule.ServerPort))
+  begin
+    if nxmodule.AliasPath <> '' then
+      LTarget := 'path ' + nxmodule.AliasPath
+    else
+      LTarget := nxmodule.AliasName;
+    if nxmodule.IsEmbedded then
+      TLogger.Info('Connected to NexusDB (embedded): ' + LTarget)
+    else
+      TLogger.Info('Connected to NexusDB: ' + LTarget +
+                   ' @ ' + nxmodule.ServerHost + ':' + IntToStr(nxmodule.ServerPort));
+  end
   else
   begin
     TLogger.Warning('Not connected to NexusDB');
@@ -172,13 +246,15 @@ begin
 end;
 
 begin
-  // Detect STDIO mode before any output - stdout is reserved for JSON-RPC
-  if HasStdioFlag then
+  // Resolve transport before any output - in STDIO mode stdout is reserved for JSON-RPC
+  UseStdio := UseStdioTransport;
+  if UseStdio then
     TLogger.UseStdErr := True;
 
   // Configure logger
   TLogger.LogToConsole := True;
   TLogger.MinLogLevel := TLogLevel.Info;
+  // File logging is opt-in via [Options] LogToFile in the .ini, applied in dmnx after config load
 
   ReportMemoryLeaksOnShutdown := True;
   IsMultiThread := True;
@@ -197,7 +273,7 @@ begin
         CreateManagerRegistry;
         try
           // Route to appropriate transport
-          if HasStdioFlag then
+          if UseStdio then
             RunStdioServer
           else
             RunHTTPServer;

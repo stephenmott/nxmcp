@@ -75,7 +75,7 @@ begin
     raise Exception.Create('Source and target table names must be different');
 
   // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
   // Close any open tables to avoid conflicts

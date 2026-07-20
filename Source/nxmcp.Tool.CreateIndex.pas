@@ -1,4 +1,4 @@
-unit nxmcp.Tool.CreateIndex;
+﻿unit nxmcp.Tool.CreateIndex;
 
 interface
 
@@ -76,6 +76,7 @@ var
   LNewIndex: TnxIndexDescriptor;
   LColumnList: TStringList;
   LFieldIdx: Integer;
+  LDups: TnxIndexDups;
   I: Integer;
 begin
   // Validate parameters
@@ -89,7 +90,7 @@ begin
     raise Exception.Create('At least one column must be specified');
 
   // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
   // Close any open tables to avoid conflicts
@@ -120,8 +121,13 @@ begin
       try
         LNewDict.Assign(LOldDict);
 
-        // Add the new index
-        LNewIndex := LNewDict.IndicesDescriptor.AddIndex(Params.IndexName, 0, Params.Unique, '', TnxCompKeyDescriptor);
+        // Add the new index. NexusDB's idDups semantics: idNone = no duplicates
+        // (unique index), idAll = duplicates allowed (non-unique).
+        if Params.Unique then
+          LDups := idNone
+        else
+          LDups := idAll;
+        LNewIndex := LNewDict.IndicesDescriptor.AddIndex(Params.IndexName, 0, LDups, '', TnxCompKeyDescriptor);
 
         // Add columns to index
         for I := 0 to LColumnList.Count - 1 do

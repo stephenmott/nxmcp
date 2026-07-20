@@ -40,7 +40,9 @@ begin
   FName := 'list_aliases';
   FTitle := 'List Database Aliases';
   FDescription := 'List all available database aliases on the connected NexusDB server. ' +
-                  'Shows the current active alias and the default alias from configuration.';
+                  'Shows the current active alias and the default alias from configuration. ' +
+                  'When the connection uses a direct server-side path instead of an alias, ' +
+                  'currentAlias is empty and currentAliasPath holds the path.';
 end;
 
 function TListAliasesTool.ExecuteWithParams(const Params: TListAliasesParams): string;
@@ -54,11 +56,40 @@ begin
   if not Assigned(nxmodule) then
     raise Exception.Create('NexusDB module not initialized');
 
-  // Session must be active to list aliases (database does not need to be connected)
-  if not nxmodule.nxSession1.Active then
-    raise Exception.Create('Not connected to NexusDB server. Session is not active.');
+  // Embedded mode has no server-side aliases; report the mode and current path only.
+  if nxmodule.IsEmbedded then
+  begin
+    LResultObj := TJSONObject.Create;
+    try
+      LResultObj.AddPair('mode', 'Embedded');
+      LResultObj.AddPair('message',
+        'Embedded (in-process) mode has no server aliases; databases are opened by path.');
+      LResultObj.AddPair('aliasCount', TJSONNumber.Create(0));
+      LResultObj.AddPair('aliases', TJSONArray.Create);
+      LResultObj.AddPair('currentAlias', nxmodule.AliasName);
+      LResultObj.AddPair('currentAliasPath', nxmodule.AliasPath);
+      LResultObj.AddPair('defaultAliasPath', nxmodule.DefaultAliasPath);
+      Result := LResultObj.ToJSON;
+    finally
+      LResultObj.Free;
+    end;
+    Exit;
+  end;
 
-  LAliasList := nxmodule.GetAliasNames;
+  // Listing aliases needs a live session, not an open database - EnsureSession
+  // rather than EnsureConnection, so the aliases can still be listed when the
+  // current database will not open, which is exactly when you need to see them.
+  if not nxmodule.EnsureSession then
+    raise Exception.Create('Not connected to NexusDB server: ' + nxmodule.GetLastError);
+
+  // A session whose socket died still reports Active; only the round-trip below
+  // finds out, so it has to be able to reconnect and retry.
+  LAliasList := nil;
+  nxmodule.ExecuteWithReconnect(
+    procedure
+    begin
+      LAliasList := nxmodule.GetAliasNames;
+    end);
   try
     LAliasesArray := TJSONArray.Create;
     for I := 0 to LAliasList.Count - 1 do
@@ -66,10 +97,13 @@ begin
 
     LResultObj := TJSONObject.Create;
     try
+      LResultObj.AddPair('mode', 'Remote');
       LResultObj.AddPair('aliasCount', TJSONNumber.Create(LAliasList.Count));
       LResultObj.AddPair('aliases', LAliasesArray);
       LResultObj.AddPair('currentAlias', nxmodule.AliasName);
+      LResultObj.AddPair('currentAliasPath', nxmodule.AliasPath);
       LResultObj.AddPair('defaultAlias', nxmodule.DefaultAliasName);
+      LResultObj.AddPair('defaultAliasPath', nxmodule.DefaultAliasPath);
       Result := LResultObj.ToJSON;
     finally
       LResultObj.Free;

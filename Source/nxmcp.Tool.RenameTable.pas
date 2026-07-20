@@ -65,14 +65,18 @@ begin
     raise Exception.Create('Old and new table names must be different');
 
   // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
   // Close any open tables to avoid conflicts
   nxmodule.nxSession1.CloseInactiveTables;
 
-  // Rename using database method
-  nxmodule.nxDatabase1.RenameTable(Params.OldName, Params.NewName, nxmodule.TablePassword);
+  // Rename using database method (auto-reconnects and retries once on lost connection)
+  nxmodule.ExecuteWithReconnect(
+    procedure
+    begin
+      nxmodule.nxDatabase1.RenameTable(Params.OldName, Params.NewName, nxmodule.TablePassword);
+    end);
 
   // Build result
   LResultObj := TJSONObject.Create;

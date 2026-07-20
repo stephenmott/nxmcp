@@ -1,4 +1,4 @@
-unit nxmcp.Tool.ListIndexes;
+﻿unit nxmcp.Tool.ListIndexes;
 
 interface
 
@@ -41,6 +41,9 @@ uses
   MCPServer.Registration,
   dmnx;
 
+type
+  TnxCrackIndexDescriptor = class(TnxIndexDescriptor);
+
 { TListIndexesTool }
 
 constructor TListIndexesTool.Create;
@@ -67,7 +70,7 @@ begin
     raise Exception.Create('Table name cannot be empty');
 
   // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
   LResultObj := TJSONObject.Create;
@@ -76,8 +79,13 @@ begin
 
     LDict := TnxDataDictionary.Create;
     try
-      nxCheck(nxmodule.nxDatabase1.GetDataDictionaryEx(
-        Params.TableName, nxmodule.TablePassword, LDict));
+      // Auto-reconnects and retries once on lost connection
+      nxmodule.ExecuteWithReconnect(
+        procedure
+        begin
+          nxCheck(nxmodule.nxDatabase1.GetDataDictionaryEx(
+            Params.TableName, nxmodule.TablePassword, LDict));
+        end);
 
       if Assigned(LDict.IndicesDescriptor) then
       begin
@@ -89,6 +97,7 @@ begin
           LIndexObj.AddPair('unique', TJSONBool.Create(LIndex.Dups = idNone));
           LIndexObj.AddPair('isDefault', TJSONBool.Create(
             LDict.IndicesDescriptor.DefaultIndex = LIndex.Number));
+          LIndexObj.AddPair('description', TnxCrackIndexDescriptor(LIndex).idDesc);
 
           // Get fields for this index
           LFieldsArray := TJSONArray.Create;

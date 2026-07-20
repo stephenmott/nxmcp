@@ -1,55 +1,126 @@
 unit nxmcp.FieldTypes;
 
+/// <summary>
+/// Shared field type conversion utilities using RTTI.
+/// Converts between user-facing type name strings and TnxFieldType enum values.
+/// </summary>
+
 interface
 
 uses
   nxsdTypes;
 
+/// <summary>
+/// Converts a user-facing type name string to a TnxFieldType.
+/// Case-insensitive. Supports both canonical names (e.g. 'Int32') and
+/// friendly aliases (e.g. 'Integer'). Raises Exception for unknown types.
+/// nxtInterval is explicitly excluded.
+/// </summary>
 function StringToFieldType(const AType: string): TnxFieldType;
+
+/// <summary>
+/// Converts a TnxFieldType to its canonical user-facing string name.
+/// Returns the friendly alias where one exists (e.g. nxtInt32 -> 'Integer').
+/// For types without an alias, strips the 'nxt' prefix from the enum name.
+/// </summary>
+function FieldTypeToString(AFieldType: TnxFieldType): string;
+
+/// <summary>
+/// Returns a comma-separated list of all supported type names
+/// for use in tool descriptions and documentation.
+/// </summary>
+function AllFieldTypeNames: string;
 
 implementation
 
 uses
-  System.SysUtils;
+  System.SysUtils,
+  System.TypInfo;
+
+const
+  NXT_PREFIX = 'nxt';
+
+type
+  TFieldTypeAlias = record
+    Name: string;        // Lowercase for matching
+    DisplayName: string; // PascalCase for display
+    FieldType: TnxFieldType;
+  end;
+
+const
+  /// Aliases: user-friendly names that don't match the nxt+Name pattern.
+  /// These are checked first in StringToFieldType and used as display names
+  /// in FieldTypeToString.
+  AliasCount = 6;
+  Aliases: array[0..AliasCount - 1] of TFieldTypeAlias = (
+    (Name: 'integer';  DisplayName: 'Integer';  FieldType: nxtInt32),
+    (Name: 'word';     DisplayName: 'Word';      FieldType: nxtWord16),
+    (Name: 'float';    DisplayName: 'Float';     FieldType: nxtDouble),
+    (Name: 'memo';     DisplayName: 'Memo';      FieldType: nxtBlobMemo),
+    (Name: 'graphic';  DisplayName: 'Graphic';   FieldType: nxtBlobGraphic),
+    (Name: 'widememo'; DisplayName: 'WideMemo';  FieldType: nxtBlobWideMemo)
+  );
 
 function StringToFieldType(const AType: string): TnxFieldType;
 var
   LType: string;
+  LEnumVal: Integer;
+  I: Integer;
 begin
-  LType := LowerCase(AType);
-  if      LType = 'boolean'     then Result := nxtBoolean
-  else if LType = 'char'        then Result := nxtChar
-  else if LType = 'widechar'    then Result := nxtWideChar
-  else if LType = 'byte'        then Result := nxtByte
-  else if LType = 'word'        then Result := nxtWord16
-  else if LType = 'word32'      then Result := nxtWord32
-  else if LType = 'int8'        then Result := nxtInt8
-  else if LType = 'int16'       then Result := nxtInt16
-  else if LType = 'integer'     then Result := nxtInt32
-  else if LType = 'int64'       then Result := nxtInt64
-  else if LType = 'autoinc'     then Result := nxtAutoInc
-  else if LType = 'single'      then Result := nxtSingle
-  else if LType = 'float'       then Result := nxtDouble
-  else if LType = 'extended'    then Result := nxtExtended
-  else if LType = 'currency'    then Result := nxtCurrency
-  else if LType = 'date'        then Result := nxtDate
-  else if LType = 'time'        then Result := nxtTime
-  else if LType = 'datetime'    then Result := nxtDateTime
-  else if LType = 'blob'        then Result := nxtBlob
-  else if LType = 'memo'        then Result := nxtBlobMemo
-  else if LType = 'graphic'     then Result := nxtBlobGraphic
-  else if LType = 'bytearray'   then Result := nxtByteArray
-  else if LType = 'shortstring' then Result := nxtShortString
-  else if LType = 'nullstring'  then Result := nxtNullString
-  else if LType = 'widestring'  then Result := nxtWideString
-  else if LType = 'recrev'      then Result := nxtRecRev
-  else if LType = 'guid'        then Result := nxtGuid
-  else if LType = 'bcd'         then Result := nxtBCD
-  else if LType = 'widememo'    then Result := nxtBlobWideMemo
-  else if LType = 'fmtbcd'      then Result := nxtFmtBCD
-  else if LType = 'refnr'       then Result := nxtRefNr
-  else
-    raise Exception.CreateFmt('Unknown field type: %s', [AType]);
+  LType := LowerCase(Trim(AType));
+
+  // 1. Check alias table (handles Integer, Word, Float, Memo, Graphic, WideMemo)
+  for I := 0 to AliasCount - 1 do
+    if LType = Aliases[I].Name then
+      Exit(Aliases[I].FieldType);
+
+  // 2. Try RTTI: prepend 'nxt' prefix and look up enum value
+  LEnumVal := GetEnumValue(TypeInfo(TnxFieldType), NXT_PREFIX + AType);
+  if LEnumVal >= 0 then
+  begin
+    Result := TnxFieldType(LEnumVal);
+    // Block nxtInterval - not currently used
+    if Result = nxtInterval then
+      raise Exception.Create('Field type Interval is not supported');
+    Exit;
+  end;
+
+  raise Exception.CreateFmt('Unknown field type: %s', [AType]);
+end;
+
+function FieldTypeToString(AFieldType: TnxFieldType): string;
+var
+  I: Integer;
+begin
+  // 1. Check alias table for friendly display names
+  for I := 0 to AliasCount - 1 do
+    if AFieldType = Aliases[I].FieldType then
+      Exit(Aliases[I].DisplayName);
+
+  // 2. Fall back to RTTI: get enum name and strip 'nxt' prefix
+  Result := GetEnumName(TypeInfo(TnxFieldType), Ord(AFieldType));
+  if Result.StartsWith(NXT_PREFIX, True) then
+    Delete(Result, 1, Length(NXT_PREFIX));
+end;
+
+function AllFieldTypeNames: string;
+var
+  LFieldType: TnxFieldType;
+  LName: string;
+  LFirst: Boolean;
+begin
+  Result := '';
+  LFirst := True;
+  for LFieldType := Low(TnxFieldType) to High(TnxFieldType) do
+  begin
+    if LFieldType = nxtInterval then
+      Continue;
+    LName := FieldTypeToString(LFieldType);
+    if not LFirst then
+      Result := Result + ', ';
+    Result := Result + LName;
+    LFirst := False;
+  end;
 end;
 
 end.

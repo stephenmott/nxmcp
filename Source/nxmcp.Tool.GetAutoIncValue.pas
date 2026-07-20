@@ -57,11 +57,15 @@ begin
     raise Exception.Create('Table name cannot be empty');
 
   // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
-  // Get auto-increment value (raises exception on failure)
-  nxmodule.nxDatabase1.GetAutoIncValue(Params.TableName, nxmodule.TablePassword, LValue);
+  // Get auto-increment value (auto-reconnects and retries once on lost connection)
+  nxmodule.ExecuteWithReconnect(
+    procedure
+    begin
+      nxmodule.nxDatabase1.GetAutoIncValue(Params.TableName, nxmodule.TablePassword, LValue);
+    end);
 
   // Build result
   LResultObj := TJSONObject.Create;

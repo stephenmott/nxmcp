@@ -64,14 +64,18 @@ begin
     raise Exception.Create('Table name cannot be empty');
 
   // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
   // Close any open tables to avoid conflicts
   nxmodule.nxSession1.CloseInactiveTables;
 
-  // Change password (using Ex version that returns error code)
-  nxCheck(nxmodule.nxDatabase1.ChangePasswordEx(Params.TableName, Params.OldPassword, Params.NewPassword));
+  // Change password (auto-reconnects and retries once on lost connection)
+  nxmodule.ExecuteWithReconnect(
+    procedure
+    begin
+      nxCheck(nxmodule.nxDatabase1.ChangePasswordEx(Params.TableName, Params.OldPassword, Params.NewPassword));
+    end);
 
   // Build result
   LResultObj := TJSONObject.Create;

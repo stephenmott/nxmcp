@@ -20,7 +20,9 @@ type
     [SchemaDescription('Name of the table to insert into')]
     property TableName: string read FTableName write FTableName;
 
-    [SchemaDescription('JSON string with column names as keys and values to insert, e.g. {"Name": "Test", "Value": 123}')]
+    [SchemaDescription('JSON string with column names as keys and values to insert, e.g. {"Name": "Test", "Value": 123}. ' +
+      'GUID, Date, Time and DateTime columns are handled automatically from plain strings: GUID (braces optional) e.g. "{1111...}"; ' +
+      'Date "YYYY-MM-DD"; Time "HH:MM:SS"; DateTime "YYYY-MM-DD HH:MM:SS" (ISO "T" separator and a trailing Z/offset are also accepted).')]
     property Data: string read FData write FData;
   end;
 
@@ -38,8 +40,11 @@ implementation
 
 uses
   Data.DB,
+  System.Generics.Collections,
+  nxsdTypes,
   MCPServer.Registration,
-  dmnx;
+  dmnx,
+  nxmcp.ValueFormat;
 
 { TInsertRecordTool }
 
@@ -60,6 +65,7 @@ var
   LValues: string;
   LPair: TJSONPair;
   LRowsAffected: Integer;
+  LFieldTypes: TDictionary<string, TnxFieldType>;
 begin
   // Validate parameters
   if Trim(Params.TableName) = '' then
@@ -78,46 +84,50 @@ begin
       raise Exception.Create('Data object cannot be empty');
 
     // Check connection
-    if not Assigned(nxmodule) or not nxmodule.IsConnected then
+    if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
       raise Exception.Create('Not connected to NexusDB');
 
-    // Build INSERT SQL
-    LColumns := '';
-    LValues := '';
+    // Look up column types so GUID (and other typed) columns are formatted
+    // correctly. Non-fatal: if the dictionary can't be read, fall back to
+    // plain literal formatting (old behaviour) rather than failing the insert.
+    try
+      LFieldTypes := GetTableFieldTypes(Params.TableName);
+    except
+      LFieldTypes := nil;
+    end;
 
-    for LPair in LDataObj do
-    begin
-      if LColumns <> '' then
+    try
+      // Build INSERT SQL
+      LColumns := '';
+      LValues := '';
+
+      for LPair in LDataObj do
       begin
-        LColumns := LColumns + ', ';
-        LValues := LValues + ', ';
+        if LColumns <> '' then
+        begin
+          LColumns := LColumns + ', ';
+          LValues := LValues + ', ';
+        end;
+
+        LColumns := LColumns + '"' + LPair.JsonString.Value + '"';
+        LValues := LValues +
+          FormatJsonValueAsSql(LPair.JsonString.Value, LPair.JsonValue, LFieldTypes);
       end;
-
-      LColumns := LColumns + '"' + LPair.JsonString.Value + '"';
-
-      // Format value based on type
-      if LPair.JsonValue is TJSONNull then
-        LValues := LValues + 'NULL'
-      else if LPair.JsonValue is TJSONNumber then
-        LValues := LValues + LPair.JsonValue.Value
-      else if LPair.JsonValue is TJSONBool then
-      begin
-        if TJSONBool(LPair.JsonValue).AsBoolean then
-          LValues := LValues + 'TRUE'
-        else
-          LValues := LValues + 'FALSE';
-      end
-      else
-        // String value - escape single quotes
-        LValues := LValues + '''' + StringReplace(LPair.JsonValue.Value, '''', '''''', [rfReplaceAll]) + '''';
+    finally
+      LFieldTypes.Free;
     end;
 
     LSql := 'INSERT INTO "' + Params.TableName + '" (' + LColumns + ') VALUES (' + LValues + ')';
 
-    // Execute
-    nxmodule.nxQuery1.Close;
-    nxmodule.nxQuery1.SQL.Text := LSql;
-    nxmodule.nxQuery1.ExecSQL;
+    // Execute (auto-reconnects and retries once on lost connection;
+    // note: retry on comm-lost after server commit can produce a duplicate row)
+    nxmodule.ExecuteWithReconnect(
+      procedure
+      begin
+        nxmodule.nxQuery1.Close;
+        nxmodule.nxQuery1.SQL.Text := LSql;
+        nxmodule.nxQuery1.ExecSQL;
+      end);
     LRowsAffected := nxmodule.nxQuery1.RowsAffected;
 
     // Build result

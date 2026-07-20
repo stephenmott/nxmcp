@@ -86,7 +86,7 @@ begin
   LOffset := Max(0, Params.Offset);
 
   // Check connection
-  if not Assigned(nxmodule) or not nxmodule.IsConnected then
+  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
   // Build SQL query
@@ -94,10 +94,14 @@ begin
   if Trim(Params.OrderBy) <> '' then
     LSql := LSql + ' ORDER BY "' + Params.OrderBy + '"';
 
-  // Execute query
-  nxmodule.nxQuery1.Close;
-  nxmodule.nxQuery1.SQL.Text := LSql;
-  nxmodule.nxQuery1.Open;
+  // Execute query (auto-reconnects and retries once on lost connection)
+  nxmodule.ExecuteWithReconnect(
+    procedure
+    begin
+      nxmodule.nxQuery1.Close;
+      nxmodule.nxQuery1.SQL.Text := LSql;
+      nxmodule.nxQuery1.Open;
+    end);
 
   try
     // Skip to offset
