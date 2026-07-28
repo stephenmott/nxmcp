@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -53,7 +54,7 @@ type
   /// <summary>
   /// MCP Tool that switches the connection to a different NexusDB server
   /// </summary>
-  TSwitchServerTool = class(TMCPToolBase<TSwitchServerParams>)
+  TSwitchServerTool = class(TSerializedToolBase<TSwitchServerParams>)
   protected
     function ExecuteWithParams(const Params: TSwitchServerParams): string; override;
   public

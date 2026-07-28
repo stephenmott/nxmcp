@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -35,7 +36,7 @@ type
   /// <summary>
   /// MCP Tool that updates records in a table
   /// </summary>
-  TUpdateRecordsTool = class(TMCPToolBase<TUpdateRecordsParams>)
+  TUpdateRecordsTool = class(TSerializedToolBase<TUpdateRecordsParams>)
   protected
     function ExecuteWithParams(const Params: TUpdateRecordsParams): string; override;
   public

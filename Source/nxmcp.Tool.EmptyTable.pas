@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -23,7 +24,7 @@ type
   /// <summary>
   /// MCP Tool that deletes all records from a table
   /// </summary>
-  TEmptyTableTool = class(TMCPToolBase<TEmptyTableParams>)
+  TEmptyTableTool = class(TSerializedToolBase<TEmptyTableParams>)
   protected
     function ExecuteWithParams(const Params: TEmptyTableParams): string; override;
   public

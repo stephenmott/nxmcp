@@ -55,7 +55,9 @@ Password=your_password
 [Options]
 ; Automatically connect on startup (1=yes, 0=no)
 AutoConnect=1
-; Connection timeout in milliseconds
+; Per-request timeout in milliseconds: a statement that exceeds this fails with
+; "The operation could not be completed in the allotted time" (raise it, or use
+; the set_timeout tool, when large table scans are expected)
 Timeout=3000
 ; Write log output to a file (1=yes, 0=no)
 LogToFile=0

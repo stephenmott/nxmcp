@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -29,7 +30,7 @@ type
   /// <summary>
   /// MCP Tool that inserts a record into a table
   /// </summary>
-  TInsertRecordTool = class(TMCPToolBase<TInsertRecordParams>)
+  TInsertRecordTool = class(TSerializedToolBase<TInsertRecordParams>)
   protected
     function ExecuteWithParams(const Params: TInsertRecordParams): string; override;
   public

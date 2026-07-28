@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -23,7 +24,7 @@ type
   /// <summary>
   /// MCP Tool that packs/compacts a table to reclaim deleted space
   /// </summary>
-  TPackTableTool = class(TMCPToolBase<TPackTableParams>)
+  TPackTableTool = class(TSerializedToolBase<TPackTableParams>)
   protected
     function ExecuteWithParams(const Params: TPackTableParams): string; override;
   public

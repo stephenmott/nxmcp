@@ -1,4 +1,4 @@
-﻿unit nxmcp.Tool.SetColumnDescription;
+unit nxmcp.Tool.SetColumnDescription;
 
 interface
 
@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   TSetColumnDescriptionParams = class
@@ -25,7 +26,7 @@ type
     property Description: string read FDescription write FDescription;
   end;
 
-  TSetColumnDescriptionTool = class(TMCPToolBase<TSetColumnDescriptionParams>)
+  TSetColumnDescriptionTool = class(TSerializedToolBase<TSetColumnDescriptionParams>)
   protected
     function ExecuteWithParams(const Params: TSetColumnDescriptionParams): string; override;
   public

@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -39,7 +40,7 @@ type
   /// <summary>
   /// MCP Tool that creates a new table
   /// </summary>
-  TCreateTableTool = class(TMCPToolBase<TCreateTableParams>)
+  TCreateTableTool = class(TSerializedToolBase<TCreateTableParams>)
   protected
     function ExecuteWithParams(const Params: TCreateTableParams): string; override;
   public

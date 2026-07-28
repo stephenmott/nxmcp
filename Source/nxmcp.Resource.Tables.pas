@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   System.Generics.Collections,
-  MCPServer.Resource.Base;
+  MCPServer.Resource.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -27,7 +28,7 @@ type
   /// MCP Resource that lists all tables in the database
   /// URI: nexusdb://tables
   /// </summary>
-  TTablesListResource = class(TMCPResourceBase<TTablesListData>)
+  TTablesListResource = class(TSerializedResourceBase<TTablesListData>)
   protected
     function GetResourceData: TTablesListData; override;
   public

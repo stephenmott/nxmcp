@@ -1,4 +1,4 @@
-﻿unit nxmcp.Tool.SetIndexDescription;
+unit nxmcp.Tool.SetIndexDescription;
 
 interface
 
@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   TSetIndexDescriptionParams = class
@@ -25,7 +26,7 @@ type
     property Description: string read FDescription write FDescription;
   end;
 
-  TSetIndexDescriptionTool = class(TMCPToolBase<TSetIndexDescriptionParams>)
+  TSetIndexDescriptionTool = class(TSerializedToolBase<TSetIndexDescriptionParams>)
   protected
     function ExecuteWithParams(const Params: TSetIndexDescriptionParams): string; override;
   public

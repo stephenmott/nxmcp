@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -37,7 +38,7 @@ type
   /// <summary>
   /// MCP Tool that switches the active database to a different alias
   /// </summary>
-  TSwitchDatabaseTool = class(TMCPToolBase<TSwitchDatabaseParams>)
+  TSwitchDatabaseTool = class(TSerializedToolBase<TSwitchDatabaseParams>)
   protected
     function ExecuteWithParams(const Params: TSwitchDatabaseParams): string; override;
   public

@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -43,7 +44,7 @@ type
   /// <summary>
   /// MCP Tool that executes SQL statements (INSERT, UPDATE, DELETE)
   /// </summary>
-  TExecuteSQLTool = class(TMCPToolBase<TExecuteSQLParams>)
+  TExecuteSQLTool = class(TSerializedToolBase<TExecuteSQLParams>)
   protected
     function ExecuteWithParams(const Params: TExecuteSQLParams): string; override;
   public

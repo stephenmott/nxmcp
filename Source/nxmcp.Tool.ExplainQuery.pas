@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -27,7 +28,7 @@ type
   /// MCP Tool that returns the execution plan for a query.
   /// Uses NexusDB query logging to show how the query will be executed.
   /// </summary>
-  TExplainQueryTool = class(TMCPToolBase<TExplainQueryParams>)
+  TExplainQueryTool = class(TSerializedToolBase<TExplainQueryParams>)
   protected
     function ExecuteWithParams(const Params: TExplainQueryParams): string; override;
   public

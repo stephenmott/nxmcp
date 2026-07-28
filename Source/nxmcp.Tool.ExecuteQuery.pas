@@ -7,7 +7,8 @@ uses
   System.JSON,
   System.Math,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -48,7 +49,7 @@ type
   /// <summary>
   /// MCP Tool that executes SQL SELECT queries and returns JSON results
   /// </summary>
-  TExecuteQueryTool = class(TMCPToolBase<TExecuteQueryParams>)
+  TExecuteQueryTool = class(TSerializedToolBase<TExecuteQueryParams>)
   protected
     function ExecuteWithParams(const Params: TExecuteQueryParams): string; override;
   public

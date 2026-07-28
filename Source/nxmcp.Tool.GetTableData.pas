@@ -7,7 +7,8 @@ uses
   System.JSON,
   System.Math,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -39,7 +40,7 @@ type
   /// <summary>
   /// MCP Tool that retrieves data from a table with pagination support
   /// </summary>
-  TGetTableDataTool = class(TMCPToolBase<TGetTableDataParams>)
+  TGetTableDataTool = class(TSerializedToolBase<TGetTableDataParams>)
   protected
     function ExecuteWithParams(const Params: TGetTableDataParams): string; override;
   public

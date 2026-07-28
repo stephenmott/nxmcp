@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -31,7 +32,7 @@ type
   /// <summary>
   /// MCP Tool that changes a table's password
   /// </summary>
-  TChangePasswordTool = class(TMCPToolBase<TChangePasswordParams>)
+  TChangePasswordTool = class(TSerializedToolBase<TChangePasswordParams>)
   protected
     function ExecuteWithParams(const Params: TChangePasswordParams): string; override;
   public

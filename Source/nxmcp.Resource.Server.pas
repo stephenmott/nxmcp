@@ -4,7 +4,8 @@ interface
 
 uses
   System.SysUtils,
-  MCPServer.Resource.Base;
+  MCPServer.Resource.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -33,7 +34,7 @@ type
   /// MCP Resource that exposes NexusDB connection status
   /// URI: nexusdb://server
   /// </summary>
-  TNexusDBServerResource = class(TMCPResourceBase<TNexusDBServerInfo>)
+  TNexusDBServerResource = class(TSerializedResourceBase<TNexusDBServerInfo>)
   protected
     function GetResourceData: TNexusDBServerInfo; override;
   public

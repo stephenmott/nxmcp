@@ -34,6 +34,7 @@ uses
   nxmcp.SqlUtils in 'nxmcp.SqlUtils.pas',
   nxmcp.ValueFormat in 'nxmcp.ValueFormat.pas',
   nxmcp.QueryParams in 'nxmcp.QueryParams.pas',
+  nxmcp.SerializedAccess in 'nxmcp.SerializedAccess.pas',
   nxmcp.Resource.Server in 'nxmcp.Resource.Server.pas',
   nxmcp.Resource.Tables in 'nxmcp.Resource.Tables.pas',
   nxmcp.Resource.Schema in 'nxmcp.Resource.Schema.pas',

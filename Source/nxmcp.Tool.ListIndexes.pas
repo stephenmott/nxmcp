@@ -1,4 +1,4 @@
-﻿unit nxmcp.Tool.ListIndexes;
+unit nxmcp.Tool.ListIndexes;
 
 interface
 
@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -23,7 +24,7 @@ type
   /// <summary>
   /// MCP Tool that lists all indexes for a table.
   /// </summary>
-  TListIndexesTool = class(TMCPToolBase<TListIndexesParams>)
+  TListIndexesTool = class(TSerializedToolBase<TListIndexesParams>)
   protected
     function ExecuteWithParams(const Params: TListIndexesParams): string; override;
   public

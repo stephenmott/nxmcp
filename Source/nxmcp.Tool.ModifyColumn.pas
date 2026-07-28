@@ -7,7 +7,8 @@ uses
   System.Classes,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -48,7 +49,7 @@ type
   /// <summary>
   /// MCP Tool that modifies a column in an existing table
   /// </summary>
-  TModifyColumnTool = class(TMCPToolBase<TModifyColumnParams>)
+  TModifyColumnTool = class(TSerializedToolBase<TModifyColumnParams>)
   protected
     function ExecuteWithParams(const Params: TModifyColumnParams): string; override;
   public

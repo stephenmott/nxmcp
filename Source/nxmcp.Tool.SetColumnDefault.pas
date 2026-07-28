@@ -1,4 +1,4 @@
-﻿unit nxmcp.Tool.SetColumnDefault;
+unit nxmcp.Tool.SetColumnDefault;
 
 interface
 
@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   TSetColumnDefaultParams = class
@@ -50,7 +51,7 @@ type
     property OverwriteNonNull: Boolean read FOverwriteNonNull write FOverwriteNonNull;
   end;
 
-  TSetColumnDefaultTool = class(TMCPToolBase<TSetColumnDefaultParams>)
+  TSetColumnDefaultTool = class(TSerializedToolBase<TSetColumnDefaultParams>)
   protected
     function ExecuteWithParams(const Params: TSetColumnDefaultParams): string; override;
   public

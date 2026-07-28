@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -24,7 +25,7 @@ type
   /// MCP Tool that returns the record count for a table.
   /// Uses NexusDB metadata for efficient counting without scanning.
   /// </summary>
-  TCountRecordsTool = class(TMCPToolBase<TCountRecordsParams>)
+  TCountRecordsTool = class(TSerializedToolBase<TCountRecordsParams>)
   protected
     function ExecuteWithParams(const Params: TCountRecordsParams): string; override;
   public

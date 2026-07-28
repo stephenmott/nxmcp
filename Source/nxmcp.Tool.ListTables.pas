@@ -6,13 +6,14 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   TListTablesParams = class
   end;
 
-  TListTablesTool = class(TMCPToolBase<TListTablesParams>)
+  TListTablesTool = class(TSerializedToolBase<TListTablesParams>)
   protected
     function ExecuteWithParams(const Params: TListTablesParams): string; override;
   public

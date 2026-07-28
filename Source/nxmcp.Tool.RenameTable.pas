@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -27,7 +28,7 @@ type
   /// <summary>
   /// MCP Tool that renames a table
   /// </summary>
-  TRenameTableTool = class(TMCPToolBase<TRenameTableParams>)
+  TRenameTableTool = class(TSerializedToolBase<TRenameTableParams>)
   protected
     function ExecuteWithParams(const Params: TRenameTableParams): string; override;
   public

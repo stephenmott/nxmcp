@@ -1,4 +1,4 @@
-﻿unit nxmcp.Tool.SetFieldValidator;
+unit nxmcp.Tool.SetFieldValidator;
 
 interface
 
@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   TSetFieldValidatorParams = class
@@ -45,7 +46,7 @@ type
     property MaxNull: Boolean read FMaxNull write FMaxNull;
   end;
 
-  TSetFieldValidatorTool = class(TMCPToolBase<TSetFieldValidatorParams>)
+  TSetFieldValidatorTool = class(TSerializedToolBase<TSetFieldValidatorParams>)
   protected
     function ExecuteWithParams(const Params: TSetFieldValidatorParams): string; override;
   public

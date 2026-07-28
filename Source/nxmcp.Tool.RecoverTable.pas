@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -23,7 +24,7 @@ type
   /// <summary>
   /// MCP Tool that attempts to recover records from a broken table
   /// </summary>
-  TRecoverTableTool = class(TMCPToolBase<TRecoverTableParams>)
+  TRecoverTableTool = class(TSerializedToolBase<TRecoverTableParams>)
   protected
     function ExecuteWithParams(const Params: TRecoverTableParams): string; override;
   public

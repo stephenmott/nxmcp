@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -19,7 +20,7 @@ type
   /// MCP Tool that returns the query log from the most recent query execution.
   /// The log is populated by TnxQuery even if the query failed.
   /// </summary>
-  TGetQueryLogTool = class(TMCPToolBase<TGetQueryLogParams>)
+  TGetQueryLogTool = class(TSerializedToolBase<TGetQueryLogParams>)
   protected
     function ExecuteWithParams(const Params: TGetQueryLogParams): string; override;
   public

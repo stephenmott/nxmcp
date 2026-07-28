@@ -1,4 +1,4 @@
-﻿unit nxmcp.Tool.GetTableSchema;
+unit nxmcp.Tool.GetTableSchema;
 
 interface
 
@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   TGetTableSchemaParams = class
@@ -17,7 +18,7 @@ type
     property TableName: string read FTableName write FTableName;
   end;
 
-  TGetTableSchemaTool = class(TMCPToolBase<TGetTableSchemaParams>)
+  TGetTableSchemaTool = class(TSerializedToolBase<TGetTableSchemaParams>)
   protected
     function ExecuteWithParams(const Params: TGetTableSchemaParams): string; override;
   public

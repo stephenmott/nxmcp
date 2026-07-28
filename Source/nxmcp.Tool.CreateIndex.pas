@@ -1,4 +1,4 @@
-﻿unit nxmcp.Tool.CreateIndex;
+unit nxmcp.Tool.CreateIndex;
 
 interface
 
@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -36,7 +37,7 @@ type
   /// <summary>
   /// MCP Tool that creates an index on a table
   /// </summary>
-  TCreateIndexTool = class(TMCPToolBase<TCreateIndexParams>)
+  TCreateIndexTool = class(TSerializedToolBase<TCreateIndexParams>)
   protected
     function ExecuteWithParams(const Params: TCreateIndexParams): string; override;
   public

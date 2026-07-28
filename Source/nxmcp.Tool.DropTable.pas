@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -23,7 +24,7 @@ type
   /// <summary>
   /// MCP Tool that deletes a table
   /// </summary>
-  TDropTableTool = class(TMCPToolBase<TDropTableParams>)
+  TDropTableTool = class(TSerializedToolBase<TDropTableParams>)
   protected
     function ExecuteWithParams(const Params: TDropTableParams): string; override;
   public

@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -38,7 +39,7 @@ type
   /// MCP Tool that executes multiple SQL statements in a single transaction.
   /// All statements succeed or all are rolled back.
   /// </summary>
-  TBatchExecuteTool = class(TMCPToolBase<TBatchExecuteParams>)
+  TBatchExecuteTool = class(TSerializedToolBase<TBatchExecuteParams>)
   protected
     function ExecuteWithParams(const Params: TBatchExecuteParams): string; override;
   public

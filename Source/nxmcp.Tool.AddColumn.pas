@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -71,7 +72,7 @@ type
   /// <summary>
   /// MCP Tool that adds a column to an existing table
   /// </summary>
-  TAddColumnTool = class(TMCPToolBase<TAddColumnParams>)
+  TAddColumnTool = class(TSerializedToolBase<TAddColumnParams>)
   protected
     function ExecuteWithParams(const Params: TAddColumnParams): string; override;
   public

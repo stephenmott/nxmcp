@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -32,7 +33,7 @@ type
   /// <summary>
   /// MCP Tool that copies a table structure (and optionally data)
   /// </summary>
-  TCopyTableTool = class(TMCPToolBase<TCopyTableParams>)
+  TCopyTableTool = class(TSerializedToolBase<TCopyTableParams>)
   protected
     function ExecuteWithParams(const Params: TCopyTableParams): string; override;
   public

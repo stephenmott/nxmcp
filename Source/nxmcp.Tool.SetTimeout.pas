@@ -1,4 +1,4 @@
-﻿unit nxmcp.Tool.SetTimeout;
+unit nxmcp.Tool.SetTimeout;
 
 interface
 
@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -24,7 +25,7 @@ type
   /// MCP Tool that sets the timeout on the NexusDB database component.
   /// Controls how long operations wait before timing out.
   /// </summary>
-  TSetTimeoutTool = class(TMCPToolBase<TSetTimeoutParams>)
+  TSetTimeoutTool = class(TSerializedToolBase<TSetTimeoutParams>)
   protected
     function ExecuteWithParams(const Params: TSetTimeoutParams): string; override;
   public

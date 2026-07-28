@@ -1,4 +1,4 @@
-﻿unit nxmcp.Tool.SetTableDescription;
+unit nxmcp.Tool.SetTableDescription;
 
 interface
 
@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   TSetTableDescriptionParams = class
@@ -21,7 +22,7 @@ type
     property Description: string read FDescription write FDescription;
   end;
 
-  TSetTableDescriptionTool = class(TMCPToolBase<TSetTableDescriptionParams>)
+  TSetTableDescriptionTool = class(TSerializedToolBase<TSetTableDescriptionParams>)
   protected
     function ExecuteWithParams(const Params: TSetTableDescriptionParams): string; override;
   public

@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -23,7 +24,7 @@ type
   /// <summary>
   /// MCP Tool that gets the next auto-increment value for a table
   /// </summary>
-  TGetAutoIncValueTool = class(TMCPToolBase<TGetAutoIncValueParams>)
+  TGetAutoIncValueTool = class(TSerializedToolBase<TGetAutoIncValueParams>)
   protected
     function ExecuteWithParams(const Params: TGetAutoIncValueParams): string; override;
   public

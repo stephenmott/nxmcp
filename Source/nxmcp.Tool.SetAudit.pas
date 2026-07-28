@@ -1,4 +1,4 @@
-﻿unit nxmcp.Tool.SetAudit;
+unit nxmcp.Tool.SetAudit;
 
 interface
 
@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   TSetAuditParams = class
@@ -32,7 +33,7 @@ type
     property IncludeBlobFields: Boolean read FIncludeBlobFields write FIncludeBlobFields;
   end;
 
-  TSetAuditTool = class(TMCPToolBase<TSetAuditParams>)
+  TSetAuditTool = class(TSerializedToolBase<TSetAuditParams>)
   protected
     function ExecuteWithParams(const Params: TSetAuditParams): string; override;
   public

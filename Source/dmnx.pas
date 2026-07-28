@@ -81,6 +81,9 @@ type
     function ExecuteWithReconnect(const AAction: TProc): Boolean;
     function IsConnected: Boolean;
     class function IsConnectionLostError(E: Exception): Boolean; static;
+    class function IsTimeoutError(E: Exception): Boolean; static;
+    class function IsReenteredError(E: Exception): Boolean; static;
+    procedure RecoverAfterTimeout;
     function GetLastError: string;
     function GetConfigPath: string;
     function GetAliasNames: TStringList;
@@ -639,6 +642,34 @@ begin
             (EnxDatabaseError(E).ErrorCode = DBIERR_SERVERCOMMLOST);
 end;
 
+// NexusDB surfaces engine errors through two exception families: EnxDatabaseError
+// (nxdb dataset/session components) and EnxBaseException (nxCheck and the engine
+// proper). Both carry the TnxResult in ErrorCode.
+function NxErrorCode(E: Exception): Integer;
+begin
+  if E is EnxDatabaseError then
+    Result := EnxDatabaseError(E).ErrorCode
+  else if E is EnxBaseException then
+    Result := EnxBaseException(E).ErrorCode
+  else
+    Result := DBIERR_NONE;
+end;
+
+class function Tnxmodule.IsTimeoutError(E: Exception): Boolean;
+begin
+  // "The operation could not be completed in the allotted time." Deliberately
+  // not matching DBIERR_NX_FILTERTIMEOUT, which is a client-side filter giving
+  // up and leaves no request running on the server.
+  Result := NxErrorCode(E) = DBIERR_NX_GENERALTIMEOUT;
+end;
+
+class function Tnxmodule.IsReenteredError(E: Exception): Boolean;
+begin
+  // "System has been illegally re-entered." - the server-side session lock is
+  // held by another request (typically one that outlived its timeout).
+  Result := NxErrorCode(E) = DBIERR_REENTERED;
+end;
+
 procedure Tnxmodule.ForceDisconnect;
 var
   LError: string;
@@ -802,6 +833,34 @@ begin
   end;
 end;
 
+procedure Tnxmodule.RecoverAfterTimeout;
+begin
+  // A timed-out request was cancelled *cooperatively*: the server thread only
+  // aborts at its next cancellation checkpoint, so when the timeout error
+  // reaches us that thread may still be running - and still holding the
+  // server-side session lock. Reusing the session now risks DBIERR_REENTERED
+  // (the next request is rejected, not queued; see ExecuteWithReconnect), and a
+  // cancel flag nobody consumed would fail the next request with "Processing
+  // was cancelled". So: tell the server to abort the orphan, then rebuild the
+  // connection - the fresh session has a new ID and a new lock, out of reach of
+  // both hazards.
+  try
+    if nxSession1.Active then
+      // Documented as callable from another thread while a request is in
+      // flight; it bypasses the client-side session lock and sets the failed
+      // flag the executing server thread polls at its checkpoints.
+      nxSession1.CancelProcessing;
+  except
+    on E: Exception do
+      // Best effort: a dead transport must not turn recovery into a new error.
+      TLogger.Warning('CancelProcessing after timeout failed: ' + E.Message);
+  end;
+
+  // A failed reconnect is non-fatal here (Reconnect logs it): the next tool
+  // call re-attempts via EnsureConnection.
+  Reconnect;
+end;
+
 function Tnxmodule.ExecuteWithReconnect(const AAction: TProc): Boolean;
 begin
   try
@@ -821,6 +880,32 @@ begin
         end
         else
           raise;
+      end
+      else if IsReenteredError(E) then
+      begin
+        // The server-side session is still locked by an earlier request -
+        // typically one that outlived its timeout (its thread runs on until the
+        // next cancellation checkpoint). The session itself is a lost cause,
+        // but the operation is not: reconnect builds a fresh session with its
+        // own lock, where the retry cannot collide with the orphaned request.
+        TLogger.Warning('NexusDB session re-entered (server still busy with an earlier request); retrying on a fresh session.');
+        if Reconnect then
+        begin
+          AAction();
+          Result := True;
+        end
+        else
+          raise;
+      end
+      else if IsTimeoutError(E) then
+      begin
+        // No retry - the statement genuinely exceeded its allotted time and
+        // the caller must see that. But clean up before the session is reused:
+        // see RecoverAfterTimeout for why reusing it as-is invites
+        // DBIERR_REENTERED or a spurious "Processing was cancelled".
+        TLogger.Warning('NexusDB operation timed out; cancelling server-side processing and re-establishing the session.');
+        RecoverAfterTimeout;
+        raise;
       end
       else
         raise;

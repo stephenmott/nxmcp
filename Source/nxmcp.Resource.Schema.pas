@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   System.Generics.Collections,
-  MCPServer.Resource.Base;
+  MCPServer.Resource.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -31,7 +32,7 @@ type
   /// MCP Resource that provides database schema overview
   /// URI: nexusdb://schema
   /// </summary>
-  TSchemaOverviewResource = class(TMCPResourceBase<TSchemaOverviewData>)
+  TSchemaOverviewResource = class(TSerializedResourceBase<TSchemaOverviewData>)
   protected
     function GetResourceData: TSchemaOverviewData; override;
   public

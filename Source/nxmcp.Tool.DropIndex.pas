@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -27,7 +28,7 @@ type
   /// <summary>
   /// MCP Tool that drops an index from a table
   /// </summary>
-  TDropIndexTool = class(TMCPToolBase<TDropIndexParams>)
+  TDropIndexTool = class(TSerializedToolBase<TDropIndexParams>)
   protected
     function ExecuteWithParams(const Params: TDropIndexParams): string; override;
   public

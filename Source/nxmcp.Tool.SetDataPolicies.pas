@@ -1,4 +1,4 @@
-﻿unit nxmcp.Tool.SetDataPolicies;
+unit nxmcp.Tool.SetDataPolicies;
 
 interface
 
@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   TSetDataPoliciesParams = class
@@ -47,7 +48,7 @@ type
     property MaxRecordCount: Integer read FMaxRecordCount write FMaxRecordCount;
   end;
 
-  TSetDataPoliciesTool = class(TMCPToolBase<TSetDataPoliciesParams>)
+  TSetDataPoliciesTool = class(TSerializedToolBase<TSetDataPoliciesParams>)
   protected
     function ExecuteWithParams(const Params: TSetDataPoliciesParams): string; override;
   public

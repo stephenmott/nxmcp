@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -18,7 +19,7 @@ type
   /// <summary>
   /// MCP Tool that lists all available database aliases on the NexusDB server
   /// </summary>
-  TListAliasesTool = class(TMCPToolBase<TListAliasesParams>)
+  TListAliasesTool = class(TSerializedToolBase<TListAliasesParams>)
   protected
     function ExecuteWithParams(const Params: TListAliasesParams): string; override;
   public

@@ -6,7 +6,8 @@ uses
   System.SysUtils,
   System.JSON,
   MCPServer.Types,
-  MCPServer.Tool.Base;
+  MCPServer.Tool.Base,
+  nxmcp.SerializedAccess;
 
 type
   /// <summary>
@@ -27,7 +28,7 @@ type
   /// <summary>
   /// MCP Tool that removes a column from a table
   /// </summary>
-  TDropColumnTool = class(TMCPToolBase<TDropColumnParams>)
+  TDropColumnTool = class(TSerializedToolBase<TDropColumnParams>)
   protected
     function ExecuteWithParams(const Params: TDropColumnParams): string; override;
   public
