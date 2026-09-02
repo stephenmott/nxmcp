@@ -68,53 +68,62 @@ end;
 
 function TTablesListResource.GetResourceData: TTablesListData;
 var
+  LData: TTablesListData;
   LTableName: string;
   LField: TField;
 begin
-  Result := TTablesListData.Create;
+  LData := TTablesListData.Create;
+  Result := LData;
   try
     if Assigned(nxmodule) and nxmodule.EnsureConnection then
     begin
-      // Query system table for table list (auto-reconnects and retries once on lost connection)
+      // Keep the complete cursor round-trip in one retryable action.  In
+      // particular, field access and iteration can be the first operation to
+      // report a dead NexusDB connection after Open succeeded.
       nxmodule.ExecuteWithReconnect(
         procedure
         begin
+          // A retry starts with a clean payload; discard rows from the failed
+          // attempt before rebuilding the cursor on the fresh session.
+          while LData.FTables.Count > 0 do
+            LData.FTables.Remove(LData.FTables.Count - 1).Free;
+          LField := nil;
           nxmodule.nxQuery1.Close;
-          nxmodule.nxQuery1.SQL.Text := 'SELECT * FROM #tables';
-          nxmodule.nxQuery1.Open;
-        end);
-      try
-        // Find the tableName field (case-insensitive search)
-        LField := nil;
-        for var I := 0 to nxmodule.nxQuery1.FieldCount - 1 do
-        begin
-          if SameText(nxmodule.nxQuery1.Fields[I].FieldName, 'tableName') or
-             SameText(nxmodule.nxQuery1.Fields[I].FieldName, 'TABLE_NAME') or
-             SameText(nxmodule.nxQuery1.Fields[I].FieldName, 'Name') then
-          begin
-            LField := nxmodule.nxQuery1.Fields[I];
-            Break;
+          try
+            nxmodule.nxQuery1.SQL.Text := 'SELECT * FROM #tables';
+            nxmodule.nxQuery1.Open;
+
+            // Find the tableName field (case-insensitive search)
+            for var I := 0 to nxmodule.nxQuery1.FieldCount - 1 do
+            begin
+              if SameText(nxmodule.nxQuery1.Fields[I].FieldName, 'tableName') or
+                 SameText(nxmodule.nxQuery1.Fields[I].FieldName, 'TABLE_NAME') or
+                 SameText(nxmodule.nxQuery1.Fields[I].FieldName, 'Name') then
+              begin
+                LField := nxmodule.nxQuery1.Fields[I];
+                Break;
+              end;
+            end;
+
+            // Fallback to second field if not found (first is usually index)
+            if LField = nil then
+              LField := nxmodule.nxQuery1.Fields[1];
+
+            while not nxmodule.nxQuery1.Eof do
+            begin
+              LTableName := LField.AsString;
+              // Skip system tables (those starting with #)
+              if (LTableName <> '') and not LTableName.StartsWith('#') then
+                LData.FTables.Add(LTableName);
+              nxmodule.nxQuery1.Next;
+            end;
+          finally
+            nxmodule.nxQuery1.Close;
           end;
-        end;
-
-        // Fallback to second field if not found (first is usually index)
-        if LField = nil then
-          LField := nxmodule.nxQuery1.Fields[1];
-
-        while not nxmodule.nxQuery1.Eof do
-        begin
-          LTableName := LField.AsString;
-          // Skip system tables (those starting with #)
-          if (LTableName <> '') and not LTableName.StartsWith('#') then
-            Result.FTables.Add(LTableName);
-          nxmodule.nxQuery1.Next;
-        end;
-      finally
-        nxmodule.nxQuery1.Close;
-      end;
+        end);
     end;
 
-    Result.Count := Result.FTables.Count;
+    LData.Count := LData.FTables.Count;
   except
     Result.Free;
     raise;

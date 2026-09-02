@@ -68,13 +68,11 @@ begin
   if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
-  // Close any open tables to avoid conflicts
-  nxmodule.nxSession1.CloseInactiveTables;
-
-  // Rename using database method (auto-reconnects and retries once on lost connection)
-  nxmodule.ExecuteWithReconnect(
+  // Renaming is deliberately never replayed after an ambiguous failure.
+  nxmodule.ExecuteWithoutRetry(
     procedure
     begin
+      nxmodule.nxSession1.CloseInactiveTables;
       nxmodule.nxDatabase1.RenameTable(Params.OldName, Params.NewName, nxmodule.TablePassword);
     end);
 

@@ -58,14 +58,11 @@ begin
   if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
-  // Close any open tables to avoid conflicts
-  nxmodule.nxSession1.CloseInactiveTables;
-
-  // Delete the table (auto-reconnects and retries once on lost connection;
-  // retry of a successful drop just returns "table not found", which is harmless)
-  nxmodule.ExecuteWithReconnect(
+  // Deleting a table is deliberately never replayed after an ambiguous failure.
+  nxmodule.ExecuteWithoutRetry(
     procedure
     begin
+      nxmodule.nxSession1.CloseInactiveTables;
       nxmodule.nxDatabase1.DeleteTable(Params.TableName, '');
     end);
 

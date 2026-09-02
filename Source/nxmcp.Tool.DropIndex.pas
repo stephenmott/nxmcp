@@ -38,6 +38,7 @@ implementation
 
 uses
   MCPServer.Registration,
+  nxmcp.SqlUtils,
   dmnx;
 
 { TDropIndexTool }
@@ -54,25 +55,20 @@ function TDropIndexTool.ExecuteWithParams(const Params: TDropIndexParams): strin
 var
   LResultObj: TJSONObject;
 begin
-  // Validate parameters
-  if Trim(Params.TableName) = '' then
-    raise Exception.Create('Table name cannot be empty');
-
-  if Trim(Params.IndexName) = '' then
-    raise Exception.Create('Index name cannot be empty');
+  // Both are concatenated into the DROP INDEX statement below.
+  CheckTableName(Params.TableName);
+  CheckIdentifier(Params.IndexName, 'index name');
 
   // Check connection
   if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
-  // Close any open tables to avoid conflicts
-  nxmodule.nxSession1.CloseInactiveTables;
-
   // Drop index using SQL (NexusDB syntax: DROP INDEX tablename.indexname)
-  // Auto-reconnects and retries once on lost connection.
-  nxmodule.ExecuteWithReconnect(
+  // DDL is deliberately never replayed after an ambiguous failure.
+  nxmodule.ExecuteWithoutRetry(
     procedure
     begin
+      nxmodule.nxSession1.CloseInactiveTables;
       nxmodule.nxQuery1.Close;
       nxmodule.nxQuery1.SQL.Text := 'DROP INDEX "' + Params.TableName + '"."' + Params.IndexName + '"';
       nxmodule.nxQuery1.ExecSQL;

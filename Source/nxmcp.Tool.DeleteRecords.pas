@@ -39,6 +39,7 @@ implementation
 uses
   Data.DB,
   MCPServer.Registration,
+  nxmcp.SqlUtils,
   dmnx;
 
 { TDeleteRecordsTool }
@@ -58,8 +59,7 @@ var
   LRowsAffected: Integer;
 begin
   // Validate parameters
-  if Trim(Params.TableName) = '' then
-    raise Exception.Create('Table name cannot be empty');
+  CheckTableName(Params.TableName);
 
   if Trim(Params.WhereClause) = '' then
     raise Exception.Create('WHERE clause is required to prevent accidental mass deletion');
@@ -70,6 +70,12 @@ begin
 
   // Build DELETE SQL
   LSql := 'DELETE FROM "' + Params.TableName + '" WHERE ' + Params.WhereClause;
+
+  // Validate the composed statement, not the fragment: this keeps the delete
+  // confined to the named table while leaving the WHERE clause fully expressive -
+  // a subselect adds no top-level semicolon, so "WHERE id IN (SELECT ...)" passes
+  // while "1=1; DROP TABLE other" does not.
+  CheckSingleStatement(LSql, 'WHERE clause');
 
   // Execute (auto-reconnects and retries once on lost connection;
   // DELETE with the same WHERE clause is safe to repeat)

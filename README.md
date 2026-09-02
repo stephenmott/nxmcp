@@ -5,6 +5,7 @@ An MCP (Model Context Protocol) server that enables AI assistants to interact wi
 ## Features
 
 * **Dual Transport** - HTTP and STDIO (for Claude Desktop and other MCP clients)
+* **Safe Shared Access** - Concurrent HTTP callers are serialized with a bounded wait, and timed-out NexusDB sessions are replaced before the next request
 * **Query Execution** - Run SELECT queries and retrieve results as JSON
 * **Data Manipulation** - Insert, update, and delete records
 * **Schema Management** - Create tables, add columns, manage indexes
@@ -18,7 +19,9 @@ An MCP (Model Context Protocol) server that enables AI assistants to interact wi
 * Delphi (RAD Studio 13) with NexusDB Komponente
 * NexusDB NXserver running and accessible
 * https://github.com/GDKsoftware/Delphi-MCP-Server (may have additional depencies)
-* https://github.com/viniciussanchez/dataset-serialize
+* https://github.com/viniciussanchez/dataset-serialize — **requires a one-line patch** for
+  `ftLongWord` columns (needed by `list_locks`; see [CHANGELOG.md](CHANGELOG.md) and
+  [upstream issue #269](https://github.com/viniciussanchez/dataset-serialize/issues/269))
 * Windows OS
 
 ## Configuration
@@ -55,8 +58,10 @@ Password=your_password
 [Options]
 ; Automatically connect on startup (1=yes, 0=no)
 AutoConnect=1
-; Connection timeout in milliseconds
+; Per-operation NexusDB timeout in milliseconds
 Timeout=3000
+; Maximum time to wait for another database request to finish (0=fail fast)
+BusyTimeout=3000
 ; Write log output to a file (1=yes, 0=no)
 LogToFile=0
 ; Log file path (leave empty for <exe name>.log next to the executable)
@@ -67,7 +72,7 @@ LogFileName=
 Port=3000
 Host=localhost
 Name=nxmcp
-Version=4.0.0.0
+Version=6.0.0.0
 Endpoint=/mcp
 
 [CORS]
@@ -93,6 +98,26 @@ RootCertFile=
 
 ## Running
 
+### Restricted or portable environments
+
+During unit initialization, the NexusDB exception hook creates a per-executable
+application-data directory below
+`C:\ProgramData\NexusDB4\nxmcp\<encoded executable directory>`. Normal Windows
+permissions allow regular users to create this directory. A sandbox, hardened service
+account, or locked-down `ProgramData` ACL may not.
+
+In such an environment, point NexusDB at a writable application-data directory:
+
+```bat
+nxmcp.exe /CONFIG:"C:\path\to\writable\nxmcp-state"
+```
+
+This switch controls NexusDB's application-data and exception-log location. It does not
+move `nxmcp.ini`, which remains next to `nxmcp.exe`, and it does not change the configured
+database path. If the default directory cannot be created, startup can fail before nxmcp's
+own error handling runs, typically as runtime error 217 followed by an application-error
+dialog.
+
 ### HTTP Transport (default)
 
 ```
@@ -100,6 +125,22 @@ nxmcp.exe
 ```
 
 The server starts on `http://localhost:3000/mcp` by default.
+
+### Concurrent HTTP clients
+
+One nxmcp process currently owns one NexusDB session. Database-backed `tools/call` and
+`resources/read` requests therefore execute one at a time; this prevents NexusDB's
+`DBIERR_REENTERED` failure when several MCP clients share the HTTP endpoint. Waiting is
+bounded by `[Options] BusyTimeout`. If the lease cannot be acquired in time, the request
+returns a normal MCP error result saying the database is busy and no database operation was
+started. `0` means fail fast; negative values are invalid and fall back to 3000 ms.
+
+`[Options] Timeout` is separate: it limits the NexusDB operation itself. Changing it with
+`set_timeout` does not change `BusyTimeout`. A general NexusDB timeout is reported once and
+is never replayed; nxmcp best-effort cancels the outstanding work, retires the affected
+session, and reconnects before releasing the execution lease. Discovery (`tools/list`,
+`resources/list`, resource-template listing), `initialize`, and `ping` do not wait for the
+database lease.
 
 ### STDIO Transport
 
@@ -166,6 +207,7 @@ Uses stdin/stdout for JSON-RPC communication. Required for Claude Desktop and ot
 | `recover_table` | Recover records from broken table | `tableName` |
 | `change_password` | Change table password | `tableName`, `oldPassword`, `newPassword` |
 | `get_autoinc_value` | Get next auto-increment value | `tableName` |
+| `close_inactive_tables` | Release the tables **and folders** the server keeps open in its cache for this session (frees server-side file handles) | _(none)_ |
 
 ### Transactions
 
@@ -180,6 +222,7 @@ Uses stdin/stdout for JSON-RPC communication. Required for Claude Desktop and ot
 | `count_records` | Fast record count via metadata | `tableName` |
 | `list_indexes` | List all indexes on a table | `tableName` |
 | `explain_query` | Show query execution plan | `sql` |
+| `list_locks` | Report live lock state from `#TABLE_LOCKS` / `#TRANSACTION_LOCKS` (degrades gracefully on older servers) | `lockType?` (table/transaction/all), `tableName?`, `maxRows?` |
 
 ### Database Management
 
@@ -196,6 +239,87 @@ Uses stdin/stdout for JSON-RPC communication. Required for Claude Desktop and ot
 | `nexusdb://server` | Connection status and server info |
 | `nexusdb://tables` | List of all tables |
 | `nexusdb://schema` | Schema overview with record counts |
+
+## Restricting the available tools
+
+`nxmcp.ini` has a `[Tools]` and a `[Resources]` section listing every tool and resource:
+
+```ini
+[Tools]
+; Set a tool to 0 to hide it: it is then not listed and cannot be called
+; Anything not listed here is available - new tools need no ini change
+execute_query=1
+execute_sql=0
+drop_table=0
+
+[Resources]
+nexusdb://server=1
+nexusdb://schema=0
+```
+
+A tool set to `0` is not returned by `tools/list` and cannot be called - the client never
+sees it. Same for resources and `resources/list` / `resources/read`.
+
+**Everything is available by default.** Only entries explicitly set to `0` are switched
+off, so an absent entry - or a tool added by a later version - is simply available, and
+existing ini files keep working untouched. A freshly generated `nxmcp.ini` lists every
+registered tool set to `1`, as a starting point to edit.
+
+This is the low-effort way to narrow nxmcp to what a given deployment should be allowed to
+do, without maintaining a fork.
+
+## Security
+
+nxmcp is a **development tool**: taken as a whole it can do anything to the target
+database, by design. What each individual tool promises, however, is enforced.
+
+| Tool | Contract |
+|------|----------|
+| `execute_query` | Strictly read-only. One SELECT, no second statement after a semicolon, no `INTO` clause. |
+| `explain_query` | One SELECT/INSERT/UPDATE/DELETE (incl. `SELECT ... INTO`). **Executes the statement** (see below); writes run in a transaction that is always rolled back. DDL rejected. |
+| `get_table_data`, `get_table_schema` | Read-only, confined to the exact table named. |
+| `insert_record`, `update_records`, `delete_records`, `drop_index` | Confined to the table named; the operation cannot be redirected elsewhere. |
+| `execute_sql`, `batch_execute` | **Unrestricted by design** - any statement, including DDL. No guarantees are made or enforced. |
+
+Two things make those contracts hold:
+
+* **Statement guards.** NexusDB executes a semicolon-separated batch submitted as a
+  single `SQL.Text` in one call, so `SELECT * FROM t; DELETE FROM t` would otherwise run
+  both. And `SELECT ... INTO` creates and populates a table, so it is a write that begins
+  with SELECT. Statements are classified with NexusDB's own SQL lexer (`TnxSQLTokenizer`),
+  so comments, string literals and quoted identifiers cannot be used to smuggle either
+  past the check. Subselects are unaffected - they add no top-level semicolon, so
+  `WHERE id IN (SELECT ...)` works normally in `update_records` / `delete_records`.
+* **Identifier validation.** Table, column, index and `orderBy` names are concatenated
+  into SQL, and NexusDB has **no escape syntax** for a quote inside a quoted identifier
+  (`SELECT 1 AS "a""b"` is a syntax error). They are therefore validated with the engine's
+  own `nxCheckValidTableName` / `nxCheckValidIdent`, whose character set excludes `"` and
+  `;`. Everything NexusDB considers a legal name still works, including meta tables
+  (`#TABLES`), memory/temp tables (`<name>`), child tables (`parent:child`) and names
+  containing spaces.
+
+**`explain_query` executes.** NexusDB has no non-executing explain - the plan is a
+by-product of running the statement (`TnxQuery.Log` is filled from the execution round
+trip; `Prepare` alone leaves it empty). A SELECT is harmless; INSERT/UPDATE/DELETE are
+wrapped in a transaction and always rolled back, and the response reports `rolledBack`.
+Once that transaction is open a lost connection is **not** retried - a retry would
+reconnect first, discarding the transaction and committing the write - so it fails
+instead, and the server rolls the transaction back on disconnect.
+
+`SELECT ... INTO` can be profiled as well, with one caveat the response spells out in a
+`note`: the rollback undoes the copied rows, but the table it creates is left behind
+empty, because creating a table is not transactional. Drop it with `drop_table` if you did
+not want it. DDL is rejected outright for that same reason.
+
+**If you embed nxmcp in a product** rather than using it as a dev tool - especially where
+an LLM composes SQL from untrusted input - point it at a NexusDB user with only the rights
+that product needs. The guards above keep each tool to its contract, but `execute_sql` and
+`batch_execute` remain deliberately unrestricted, so the connection's own rights are the
+only limit on what the server will accept. A restricted user is a structural boundary; the
+tool contracts are not a substitute for one. Alternatively, switch off the tools you do not
+need in `[Tools]` (see above), or build your own fork restricted to the tools you deem
+safe - each tool is a self-contained unit registered in `nxmcp.dpr`, so removing one is a
+single line.
 
 ## Column Types
 

@@ -72,7 +72,9 @@ begin
   inherited;
   FName := 'execute_query';
   FTitle := 'Execute SQL Query';
-  FDescription := 'Execute a SQL SELECT query against the NexusDB database and return results as JSON. ' +
+  FDescription := 'Execute a single SQL SELECT query against the NexusDB database and return ' +
+                  'results as JSON. Strictly read-only: exactly one statement (no second ' +
+                  'statement after a semicolon) and no INTO clause. ' +
                   'Use this for reading data. For INSERT/UPDATE/DELETE, use execute_sql instead. ' +
                   'Supports named parameters: write :name placeholders in the SQL and supply values via params ' +
                   '(preferred over embedding values in the SQL - no escaping or typed-literal syntax needed). ' +
@@ -87,15 +89,30 @@ var
   LJSONArray: TJSONArray;
   LResultObj: TJSONObject;
   LSql: string;
+  LJsonResult: string;
   LHasLog: Boolean;
+  LFacts: TnxSqlFacts;
+  LFailureLog: TJSONArray;
 begin
   // Validate parameters
   if Trim(Params.Sql) = '' then
     raise Exception.Create('SQL query cannot be empty');
 
-  // Check for non-SELECT statements (strip statement switches like #T, #I, #S, #L, #B, #V first)
-  if not IsSelectStatement(Params.Sql) then
+  // This tool's contract is "reads only". NexusDB executes a semicolon-separated
+  // batch submitted as one SQL.Text in a single call, and SELECT ... INTO creates
+  // and populates a table, so a bare StartsWith('SELECT') is not enough to hold
+  // that contract - both are writes that begin with SELECT.
+  LFacts := AnalyzeSql(Params.Sql);
+  if LFacts.Kind = skUnparsable then
+    raise Exception.Create('SQL could not be parsed. Check the statement syntax.');
+  if LFacts.Kind <> skSelect then
     raise Exception.Create('Only SELECT queries are allowed. Use execute_sql for other statements.');
+  if not LFacts.IsSingle then
+    raise Exception.Create('Only a single SELECT is allowed - a second statement after a ' +
+      'semicolon would also be executed. Use batch_execute to run several statements.');
+  if LFacts.HasInto then
+    raise Exception.Create('SELECT ... INTO creates and populates a table, so it is not a ' +
+      'read. Use execute_sql for it.');
 
   // Determine max rows
   if Params.MaxRows > 0 then
@@ -115,76 +132,116 @@ begin
   else if Params.Log then
     LSql := '#L+ ' + LSql;
 
-  // Execute query (auto-reconnects and retries once on lost connection)
+  LJSONArray := nil;
+  LResultObj := nil;
+  LFailureLog := nil;
   try
-    nxmodule.ExecuteWithReconnect(
-      procedure
-      begin
-        nxmodule.nxQuery1.Close;
-        // Drop bindings left over from a previous statement: setting SQL.Text
-        // carries old values onto same-named params (TParams.AssignValues),
-        // which would defeat the missing-parameter check below.
-        nxmodule.nxQuery1.Params.Clear;
-        nxmodule.nxQuery1.SQL.Text := LSql;
-        ApplyJsonParamsToQuery(nxmodule.nxQuery1, Params.Params);
-        nxmodule.nxQuery1.Open;
-      end);
-  except
-    on E: Exception do
-    begin
-      // If log was requested, include it even on failure (TnxQuery populates Log before raising)
-      if LHasLog and (nxmodule.nxQuery1.Log.Count > 0) then
-      begin
-        LResultObj := TJSONObject.Create;
-        try
-          LResultObj.AddPair('error', E.Message);
-          LResultObj.AddPair('log', LogToJSONArray(nxmodule.nxQuery1.Log));
-          Result := LResultObj.ToJSON;
-        finally
-          LResultObj.Free;
-        end;
-        Exit;
-      end;
-      raise;
-    end;
-  end;
-
-  try
-    // Build JSON array, returning at most LMaxRows rows
-    LRowCount := 0;
-    LJSONArray := TJSONArray.Create;
+    // Keep opening, reading, and closing in one retryable action. A lost
+    // session during cursor traversal must rebuild the complete result on the
+    // fresh session rather than retrying only the Open call.
     try
-      nxmodule.nxQuery1.First;
-      while (not nxmodule.nxQuery1.Eof) and (LRowCount < LMaxRows) do
-      begin
-        LJSONArray.AddElement(nxmodule.nxQuery1.ToJSONObject);
-        Inc(LRowCount);
-        nxmodule.nxQuery1.Next;
-      end;
+      nxmodule.ExecuteWithReconnect(
+        procedure
+        begin
+          // Reset any partial result left by an earlier attempt before the
+          // retry allocates a new cursor result.
+          LResultObj.Free;
+          LResultObj := nil;
+          LJSONArray.Free;
+          LJSONArray := nil;
+          try
+            nxmodule.nxQuery1.Close;
+            // Drop bindings left over from a previous statement: setting SQL.Text
+            // carries old values onto same-named params (TParams.AssignValues),
+            // which would defeat the missing-parameter check below.
+            nxmodule.nxQuery1.Params.Clear;
+            nxmodule.nxQuery1.SQL.Text := LSql;
+            ApplyJsonParamsToQuery(nxmodule.nxQuery1, Params.Params);
+            nxmodule.nxQuery1.Open;
 
-      // Build result with metadata
-      LResultObj := TJSONObject.Create;
-      try
-        LResultObj.AddPair('rowCount', TJSONNumber.Create(LRowCount));
-        LResultObj.AddPair('maxRows', TJSONNumber.Create(LMaxRows));
-        LResultObj.AddPair('truncated', TJSONBool.Create(not nxmodule.nxQuery1.Eof));
-        LResultObj.AddPair('data', LJSONArray);
+            // Build JSON array, returning at most LMaxRows rows.
+            LRowCount := 0;
+            LJSONArray := TJSONArray.Create;
+            nxmodule.nxQuery1.First;
+            while (not nxmodule.nxQuery1.Eof) and (LRowCount < LMaxRows) do
+            begin
+              LJSONArray.AddElement(nxmodule.nxQuery1.ToJSONObject);
+              Inc(LRowCount);
+              nxmodule.nxQuery1.Next;
+            end;
 
-        // Include log output if requested
-        if LHasLog then
-          LResultObj.AddPair('log', LogToJSONArray(nxmodule.nxQuery1.Log));
+            // Build result with metadata. Transfer the array explicitly so
+            // the action's cleanup cannot free data owned by the object.
+            LResultObj := TJSONObject.Create;
+            LResultObj.AddPair('rowCount', TJSONNumber.Create(LRowCount));
+            LResultObj.AddPair('maxRows', TJSONNumber.Create(LMaxRows));
+            LResultObj.AddPair('truncated', TJSONBool.Create(not nxmodule.nxQuery1.Eof));
+            LResultObj.AddPair('data', LJSONArray);
+            LJSONArray := nil;
 
-        Result := LResultObj.ToJSON;
-      finally
-        // Note: LJSONArray ownership transferred to LResultObj
-        LResultObj.Free;
-      end;
+            // Include log output if requested.
+            if LHasLog then
+              LResultObj.AddPair('log', LogToJSONArray(nxmodule.nxQuery1.Log));
+
+            LJsonResult := LResultObj.ToJSON;
+          finally
+            LResultObj.Free;
+            LResultObj := nil;
+            LJSONArray.Free;
+            LJSONArray := nil;
+            nxmodule.nxQuery1.Close;
+          end;
+        end,
+        procedure(E: Exception)
+        begin
+          // Recovery rebuilds nxQuery1, so preserve diagnostics before it can
+          // discard the failed session's log. Keep an earlier snapshot if a
+          // later poisoned attempt has no log of its own.
+          if LHasLog and (nxmodule.nxQuery1.Log.Count > 0) then
+          begin
+            LFailureLog.Free;
+            LFailureLog := LogToJSONArray(nxmodule.nxQuery1.Log);
+          end;
+        end);
+      Result := LJsonResult;
     except
-      LJSONArray.Free;
-      raise;
+      on E: Exception do
+      begin
+        // A poisoned-session failure has already gone through recovery. Use
+        // the pre-recovery snapshot; ordinary errors retain the old live-log
+        // behavior.
+        if LHasLog then
+        begin
+          LResultObj := TJSONObject.Create;
+          try
+            LResultObj.AddPair('error', E.Message);
+            if Assigned(LFailureLog) then
+            begin
+              LResultObj.AddPair('log', LFailureLog);
+              LFailureLog := nil;
+            end
+            else if Assigned(nxmodule) and (nxmodule.nxQuery1.Log.Count > 0) then
+              LResultObj.AddPair('log', LogToJSONArray(nxmodule.nxQuery1.Log));
+            if LResultObj.GetValue('log') <> nil then
+            begin
+              Result := LResultObj.ToJSON;
+              Exit;
+            end;
+          finally
+            LResultObj.Free;
+            LResultObj := nil;
+          end;
+        end;
+        raise;
+      end;
     end;
   finally
-    nxmodule.nxQuery1.Close;
+    LFailureLog.Free;
+    LFailureLog := nil;
+    LResultObj.Free;
+    LResultObj := nil;
+    LJSONArray.Free;
+    LJSONArray := nil;
   end;
 end;
 

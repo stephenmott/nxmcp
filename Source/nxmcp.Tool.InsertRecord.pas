@@ -43,6 +43,7 @@ uses
   System.Generics.Collections,
   nxsdTypes,
   MCPServer.Registration,
+  nxmcp.SqlUtils,
   dmnx,
   nxmcp.ValueFormat;
 
@@ -68,8 +69,7 @@ var
   LFieldTypes: TDictionary<string, TnxFieldType>;
 begin
   // Validate parameters
-  if Trim(Params.TableName) = '' then
-    raise Exception.Create('Table name cannot be empty');
+  CheckTableName(Params.TableName);
 
   if Trim(Params.Data) = '' then
     raise Exception.Create('Data cannot be empty');
@@ -108,6 +108,10 @@ begin
           LColumns := LColumns + ', ';
           LValues := LValues + ', ';
         end;
+
+        // The JSON key becomes a quoted column name in the SQL - validate it the
+        // same way as the table name.
+        CheckIdentifier(LPair.JsonString.Value, 'column name');
 
         LColumns := LColumns + '"' + LPair.JsonString.Value + '"';
         LValues := LValues +

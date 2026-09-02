@@ -7,7 +7,8 @@ uses
   nxsdServerEngine, nxreRemoteServerEngine, nxdb, Data.DB, nxllComponent,
   nxllTransport, nxptBasePooledTransport, nxthHttpTransport, nxtwWinsockTransport,
   System.JSON, DataSet.Serialize, DataSet.Serialize.Config, System.Generics.Collections,
-  nxdbBase, nxllBde, nxsrServerEngine, nxsrSqlEngineBase, nxsqlEngine;
+  nxdbBase, nxllBde, nxsrServerEngine, nxsrSqlEngineBase, nxsqlEngine,
+  nxmcp.NexusErrors;
 
 type
   /// <summary>
@@ -48,9 +49,18 @@ type
     FPassword: string;
     FAutoConnect: Boolean;
     FTimeout: Integer;
+    FBusyTimeout: Integer;
     FLogToFile: Boolean;
     FLogFileName: string;
     FConfigPath: string;
+    // Explicit [Tools]/[Resources] switches from the ini. Absent means enabled:
+    // this is a dev tool, so everything is on unless it was deliberately turned
+    // off - no friction for the default case.
+    FToolSwitches: TDictionary<string, Boolean>;
+    FResourceSwitches: TDictionary<string, Boolean>;
+    procedure LoadSwitches(AIni: TMemIniFile; const ASection: string;
+      ADest: TDictionary<string, Boolean>);
+    procedure LogDisabled(const AWhat: string; ASwitches: TDictionary<string, Boolean>);
     procedure LoadConfig;
     procedure CreateDefaultConfig;
     procedure ConfigureComponents;
@@ -71,6 +81,9 @@ type
     procedure CloseDatabaseForSwitch;
     procedure DisconnectForSwitch;
     function OpenTargetDatabase: Boolean;
+    procedure RetireSessionAfterError(E: Exception);
+    function ExecuteWithPolicy(const AAction: TProc;
+      AAllowRetry: Boolean; const ABeforeRecovery: TNxFailureProc = nil): Boolean;
   public
     function Connect: Boolean;
     procedure Disconnect;
@@ -78,9 +91,16 @@ type
     function Reconnect: Boolean;
     function EnsureConnection: Boolean;
     function EnsureSession: Boolean;
-    function ExecuteWithReconnect(const AAction: TProc): Boolean;
+    function ExecuteWithReconnect(const AAction: TProc): Boolean; overload;
+    function ExecuteWithReconnect(const AAction: TProc;
+      const ABeforeRecovery: TNxFailureProc): Boolean; overload;
+    function ExecuteWithoutRetry(const AAction: TProc): Boolean;
+    function RecoverSessionAfterError(E: Exception): Boolean;
     function IsConnected: Boolean;
+    class function NexusErrorCode(E: Exception): Integer; static;
     class function IsConnectionLostError(E: Exception): Boolean; static;
+    class function IsTimeoutError(E: Exception): Boolean; static;
+    class function IsReenteredError(E: Exception): Boolean; static;
     function GetLastError: string;
     function GetConfigPath: string;
     function GetAliasNames: TStringList;
@@ -93,6 +113,10 @@ type
       const AAliasPath: string = ''): Boolean;
     function SwitchToEmbedded(const AAliasPath: string;
       const ATablePassword: string = ''): Boolean;
+    /// <summary>True unless [Tools] ToolName=0 is present in the ini.</summary>
+    function IsToolEnabled(const AToolName: string): Boolean;
+    /// <summary>True unless [Resources] URI=0 is present in the ini.</summary>
+    function IsResourceEnabled(const AResourceURI: string): Boolean;
     class function ModeToStr(AMode: TnxServerMode): string; static;
     class function StrToMode(const AValue: string; ADefault: TnxServerMode): TnxServerMode; static;
     property ServerMode: TnxServerMode read FServerMode;
@@ -107,6 +131,7 @@ type
     property DefaultServerHost: string read FDefaultServerHost;
     property DefaultServerPort: Integer read FDefaultServerPort;
     property TablePassword: string read FTablePassword;
+    property BusyTimeout: Integer read FBusyTimeout;
   end;
 
 var
@@ -124,7 +149,10 @@ uses
   // process restart. We surface that state in our error messages.
   nxllException,
   nxmcp.FileLog,
-  MCPServer.Logger;
+  MCPServer.Logger,
+  // Only to enumerate the registered tools/resources when generating a default
+  // ini - the tool units have already registered themselves by then.
+  MCPServer.Registration;
 
 {%CLASSGROUP 'System.Classes.TPersistent'}
 
@@ -152,6 +180,8 @@ end;
 procedure Tnxmodule.DataModuleCreate(Sender: TObject);
 begin
   GLastError := '';
+  FToolSwitches := TDictionary<string, Boolean>.Create;
+  FResourceSwitches := TDictionary<string, Boolean>.Create;
   LoadConfig;
   ConfigureLogging;
   ConfigureSerializer;
@@ -164,6 +194,8 @@ end;
 procedure Tnxmodule.DataModuleDestroy(Sender: TObject);
 begin
   Disconnect;
+  FreeAndNil(FToolSwitches);
+  FreeAndNil(FResourceSwitches);
 end;
 
 procedure Tnxmodule.LoadConfig;
@@ -185,6 +217,7 @@ begin
   FPassword := 'NexusDB';
   FAutoConnect := True;
   FTimeout := 3000;
+  FBusyTimeout := 3000;
   FLogToFile := False;
   FLogFileName := '';
 
@@ -238,16 +271,90 @@ begin
     // Options section
     FAutoConnect := LIniFile.ReadBool('Options', 'AutoConnect', FAutoConnect);
     FTimeout := LIniFile.ReadInteger('Options', 'Timeout', FTimeout);
+    FBusyTimeout := LIniFile.ReadInteger('Options', 'BusyTimeout', FBusyTimeout);
+    if FBusyTimeout < 0 then
+    begin
+      TLogger.Warning(Format(
+        'Invalid [Options] BusyTimeout=%d; using 3000 ms.', [FBusyTimeout]));
+      FBusyTimeout := 3000;
+    end;
     FLogToFile := LIniFile.ReadBool('Options', 'LogToFile', FLogToFile);
     FLogFileName := LIniFile.ReadString('Options', 'LogFileName', FLogFileName);
+
+    // Per-tool / per-resource availability
+    LoadSwitches(LIniFile, 'Tools', FToolSwitches);
+    LoadSwitches(LIniFile, 'Resources', FResourceSwitches);
   finally
     LIniFile.Free;
   end;
+
+  LogDisabled('tool', FToolSwitches);
+  LogDisabled('resource', FResourceSwitches);
+end;
+
+procedure Tnxmodule.LoadSwitches(AIni: TMemIniFile; const ASection: string;
+  ADest: TDictionary<string, Boolean>);
+var
+  LNames: TStringList;
+  LName: string;
+begin
+  ADest.Clear;
+  if not AIni.SectionExists(ASection) then
+    Exit;
+
+  LNames := TStringList.Create;
+  try
+    AIni.ReadSection(ASection, LNames);
+    for LName in LNames do
+    begin
+      // Comment lines are written as keys with an empty value (the pattern the
+      // rest of this ini uses); they are not switches.
+      if LName.StartsWith(';') then
+        Continue;
+      ADest.AddOrSetValue(LowerCase(LName), AIni.ReadBool(ASection, LName, True));
+    end;
+  finally
+    LNames.Free;
+  end;
+end;
+
+procedure Tnxmodule.LogDisabled(const AWhat: string;
+  ASwitches: TDictionary<string, Boolean>);
+var
+  LPair: TPair<string, Boolean>;
+  LNames: string;
+begin
+  LNames := '';
+  for LPair in ASwitches do
+    if not LPair.Value then
+    begin
+      if LNames <> '' then
+        LNames := LNames + ', ';
+      LNames := LNames + LPair.Key;
+    end;
+
+  if LNames <> '' then
+    TLogger.Info('Disabled by configuration (' + AWhat + '): ' + LNames);
+end;
+
+function Tnxmodule.IsToolEnabled(const AToolName: string): Boolean;
+begin
+  // Unknown entries default to enabled - a tool added later is available without
+  // anyone having to touch an existing ini.
+  if not FToolSwitches.TryGetValue(LowerCase(AToolName), Result) then
+    Result := True;
+end;
+
+function Tnxmodule.IsResourceEnabled(const AResourceURI: string): Boolean;
+begin
+  if not FResourceSwitches.TryGetValue(LowerCase(AResourceURI), Result) then
+    Result := True;
 end;
 
 procedure Tnxmodule.CreateDefaultConfig;
 var
   LIniFile: TMemIniFile;
+  LName: string;
 begin
   LIniFile := TMemIniFile.Create(FConfigPath);
   try
@@ -283,8 +390,10 @@ begin
     // Options section
     LIniFile.WriteString('Options', '; Automatically connect on startup (1=yes, 0=no)', '');
     LIniFile.WriteBool('Options', 'AutoConnect', True);
-    LIniFile.WriteString('Options', '; Connection timeout in milliseconds', '');
+    LIniFile.WriteString('Options', '; NexusDB operation timeout in milliseconds', '');
     LIniFile.WriteInteger('Options', 'Timeout', 3000);
+    LIniFile.WriteString('Options', '; Maximum time to wait for another NexusDB request to finish (0 = fail fast)', '');
+    LIniFile.WriteInteger('Options', 'BusyTimeout', 3000);
     LIniFile.WriteString('Options', '; Write log output to a file (1=yes, 0=no)', '');
     LIniFile.WriteBool('Options', 'LogToFile', False);
     LIniFile.WriteString('Options', '; Log file path (leave empty for <exe name>.<pid>.log next to the executable)', '');
@@ -295,7 +404,7 @@ begin
     LIniFile.WriteInteger('Server', 'Port', 3000);
     LIniFile.WriteString('Server', 'Host', 'localhost');
     LIniFile.WriteString('Server', 'Name', 'nxmcp');
-    LIniFile.WriteString('Server', 'Version', '4.0.0.0');
+    LIniFile.WriteString('Server', 'Version', '6.0.0.0');
     LIniFile.WriteString('Server', 'Endpoint', '/mcp');
     LIniFile.WriteString('Server', '; Transport: http (network server, default) or stdio (for stdio MCP clients like Claude Code)', '');
     LIniFile.WriteString('Server', '; Overridden by the --stdio / --http command-line flags when present', '');
@@ -313,6 +422,19 @@ begin
     LIniFile.WriteString('SSL', 'CertFile', '');
     LIniFile.WriteString('SSL', 'KeyFile', '');
     LIniFile.WriteString('SSL', 'RootCertFile', '');
+
+    // Tools / Resources sections - every entry written as 1 (available). The list
+    // comes from TMCPRegistry rather than a hard-coded table here: the tool units
+    // register themselves in their initialization sections, which run before this,
+    // so a newly added tool turns up in a freshly generated ini automatically.
+    LIniFile.WriteString('Tools', '; Set a tool to 0 to hide it: it is then not listed and cannot be called', '');
+    LIniFile.WriteString('Tools', '; Anything not listed here is available - new tools need no ini change', '');
+    for LName in TMCPRegistry.GetToolNames do
+      LIniFile.WriteBool('Tools', LName, True);
+
+    LIniFile.WriteString('Resources', '; Set a resource URI to 0 to hide it', '');
+    for LName in TMCPRegistry.GetResourceURIs do
+      LIniFile.WriteBool('Resources', LName, True);
 
     LIniFile.UpdateFile;
   finally
@@ -635,8 +757,22 @@ end;
 
 class function Tnxmodule.IsConnectionLostError(E: Exception): Boolean;
 begin
-  Result := (E is EnxDatabaseError) and
-            (EnxDatabaseError(E).ErrorCode = DBIERR_SERVERCOMMLOST);
+  Result := nxmcp.NexusErrors.IsConnectionLostError(E);
+end;
+
+class function Tnxmodule.NexusErrorCode(E: Exception): Integer;
+begin
+  Result := nxmcp.NexusErrors.NexusErrorCode(E);
+end;
+
+class function Tnxmodule.IsTimeoutError(E: Exception): Boolean;
+begin
+  Result := nxmcp.NexusErrors.IsTimeoutError(E);
+end;
+
+class function Tnxmodule.IsReenteredError(E: Exception): Boolean;
+begin
+  Result := nxmcp.NexusErrors.IsReenteredError(E);
 end;
 
 procedure Tnxmodule.ForceDisconnect;
@@ -802,30 +938,83 @@ begin
   end;
 end;
 
-function Tnxmodule.ExecuteWithReconnect(const AAction: TProc): Boolean;
+procedure Tnxmodule.RetireSessionAfterError(E: Exception);
 begin
-  try
-    AAction();
-    Result := True;
-  except
-    on E: Exception do
-    begin
-      if IsConnectionLostError(E) then
-      begin
-        TLogger.Warning('Lost communication with NexusDB during operation; attempting reconnect.');
-        if Reconnect then
-        begin
-          // Retry once. Any exception from the second attempt bubbles up to caller.
-          AAction();
-          Result := True;
-        end
-        else
-          raise;
-      end
-      else
-        raise;
+  if not (IsTimeoutError(E) or IsReenteredError(E) or
+    IsConnectionLostError(E)) then
+    Exit;
+
+  if IsTimeoutError(E) or IsReenteredError(E) then
+  begin
+    // NexusDB timeouts are cooperative. The server worker may still own this
+    // session's lock after the timeout reaches the client. CancelProcessing is
+    // explicitly safe from another thread and bypasses that client-side lock.
+    try
+      if nxSession1.Active then
+        nxSession1.CancelProcessing;
+    except
+      on LCancelError: Exception do
+        TLogger.Warning('CancelProcessing while retiring a poisoned session failed: ' +
+          LCancelError.Message);
     end;
   end;
+
+  // Always finish the complete guarded teardown. A half-closed component chain
+  // can otherwise silently reuse the old session or transport.
+  ForceDisconnect;
+end;
+
+function Tnxmodule.RecoverSessionAfterError(E: Exception): Boolean;
+begin
+  Result := False;
+
+  if IsTimeoutError(E) then
+    TLogger.Warning('NexusDB operation timed out; retiring the session without retrying.')
+  else if IsReenteredError(E) then
+    TLogger.Warning('NexusDB session was re-entered; retiring the locked session.')
+  else if IsConnectionLostError(E) then
+    TLogger.Warning('Lost communication with NexusDB; rebuilding the connection.')
+  else
+    Exit;
+
+  RetireSessionAfterError(E);
+
+  // Connect is fail-soft and records its own error. RetireSessionAfterError
+  // already completed teardown, so do not run that sequence a second time.
+  Result := Connect;
+  if not Result then
+    TLogger.Warning('Failed to establish a clean NexusDB session: ' + GLastError);
+end;
+
+function Tnxmodule.ExecuteWithPolicy(const AAction: TProc;
+  AAllowRetry: Boolean; const ABeforeRecovery: TNxFailureProc): Boolean;
+begin
+  Result := ExecuteNexusPolicy(AAction, AAllowRetry,
+    function(E: Exception): Boolean
+    begin
+      Result := RecoverSessionAfterError(E);
+    end,
+    procedure
+    begin
+      TLogger.Info('Retrying NexusDB operation once on a fresh session.');
+    end,
+    ABeforeRecovery);
+end;
+
+function Tnxmodule.ExecuteWithReconnect(const AAction: TProc): Boolean;
+begin
+  Result := ExecuteWithPolicy(AAction, True);
+end;
+
+function Tnxmodule.ExecuteWithReconnect(const AAction: TProc;
+  const ABeforeRecovery: TNxFailureProc): Boolean;
+begin
+  Result := ExecuteWithPolicy(AAction, True, ABeforeRecovery);
+end;
+
+function Tnxmodule.ExecuteWithoutRetry(const AAction: TProc): Boolean;
+begin
+  Result := ExecuteWithPolicy(AAction, False);
 end;
 
 function Tnxmodule.GetLastError: string;
@@ -932,6 +1121,11 @@ begin
     begin
       // Held in a local: the rollback below runs Connect, which overwrites GLastError.
       LFailure := 'Failed to switch to ' + LTargetDesc + ': ' + E.Message;
+
+      // A timeout/re-entry/communication loss invalidates the session. Retire it
+      // before restoring the old target; reconnecting here would use the failed
+      // target because the tracking fields have not been rolled back yet.
+      RetireSessionAfterError(E);
 
       // Attempt to rollback to the previous target (name or path)
       try
@@ -1078,6 +1272,8 @@ begin
       LFailure := 'Failed to switch to server "' + AServerHost + ':' +
                   IntToStr(AServerPort) + '": ' + E.Message;
 
+      RetireSessionAfterError(E);
+
       // Attempt to rollback to previous server
       try
         FServerMode := LOldMode;
@@ -1188,6 +1384,8 @@ begin
       // Held in a local: the rollback below runs Connect, which overwrites GLastError.
       LFailure := 'Failed to switch to embedded database "' + AAliasPath +
                   '": ' + E.Message;
+
+      RetireSessionAfterError(E);
 
       // Attempt to rollback to the previous mode/target
       try

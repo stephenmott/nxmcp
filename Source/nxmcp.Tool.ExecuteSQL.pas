@@ -80,6 +80,7 @@ var
   LSqlUpper: string;
   LSql: string;
   LHasLog: Boolean;
+  LFailureLog: TJSONArray;
 begin
   // Validate parameters
   if Trim(Params.Sql) = '' then
@@ -103,55 +104,82 @@ begin
   else if Params.Log then
     LSql := '#L+ ' + LSql;
 
-  // Execute SQL (auto-reconnects and retries once on lost connection)
+  LFailureLog := nil;
   try
-    nxmodule.ExecuteWithReconnect(
-      procedure
+    // Execute SQL (auto-reconnects and retries once on lost connection)
+    try
+      nxmodule.ExecuteWithReconnect(
+        procedure
+        begin
+          nxmodule.nxQuery1.Close;
+          // Drop bindings left over from a previous statement: setting SQL.Text
+          // carries old values onto same-named params (TParams.AssignValues),
+          // which would defeat the missing-parameter check below.
+          nxmodule.nxQuery1.Params.Clear;
+          nxmodule.nxQuery1.SQL.Text := LSql;
+          ApplyJsonParamsToQuery(nxmodule.nxQuery1, Params.Params);
+          nxmodule.nxQuery1.ExecSQL;
+        end,
+        procedure(E: Exception)
+        begin
+          // Recovery rebuilds nxQuery1, so preserve diagnostics before it can
+          // discard the failed session's log.
+          if LHasLog and (nxmodule.nxQuery1.Log.Count > 0) then
+          begin
+            LFailureLog.Free;
+            LFailureLog := LogToJSONArray(nxmodule.nxQuery1.Log);
+          end;
+        end);
+    except
+      on E: Exception do
       begin
-        nxmodule.nxQuery1.Close;
-        // Drop bindings left over from a previous statement: setting SQL.Text
-        // carries old values onto same-named params (TParams.AssignValues),
-        // which would defeat the missing-parameter check below.
-        nxmodule.nxQuery1.Params.Clear;
-        nxmodule.nxQuery1.SQL.Text := LSql;
-        ApplyJsonParamsToQuery(nxmodule.nxQuery1, Params.Params);
-        nxmodule.nxQuery1.ExecSQL;
-      end);
-  except
-    on E: Exception do
-    begin
-      // If log was requested, include it even on failure
-      if LHasLog and (nxmodule.nxQuery1.Log.Count > 0) then
-      begin
-        LResultObj := TJSONObject.Create;
-        try
-          LResultObj.AddPair('error', E.Message);
-          LResultObj.AddPair('log', LogToJSONArray(nxmodule.nxQuery1.Log));
-          Result := LResultObj.ToJSON;
-        finally
-          LResultObj.Free;
+        // Use the pre-recovery snapshot for poisoned-session failures. For
+        // ordinary errors, retain the existing live-log behavior.
+        if LHasLog then
+        begin
+          LResultObj := TJSONObject.Create;
+          try
+            LResultObj.AddPair('error', E.Message);
+            if Assigned(LFailureLog) then
+            begin
+              LResultObj.AddPair('log', LFailureLog);
+              LFailureLog := nil;
+            end
+            else if Assigned(nxmodule) and (nxmodule.nxQuery1.Log.Count > 0) then
+              LResultObj.AddPair('log', LogToJSONArray(nxmodule.nxQuery1.Log));
+            if LResultObj.GetValue('log') <> nil then
+            begin
+              Result := LResultObj.ToJSON;
+              Exit;
+            end;
+          finally
+            LResultObj.Free;
+          end;
         end;
-        Exit;
+        raise;
       end;
-      raise;
     end;
-  end;
-  LRowsAffected := nxmodule.nxQuery1.RowsAffected;
 
-  // Build result
-  LResultObj := TJSONObject.Create;
-  try
-    LResultObj.AddPair('success', TJSONBool.Create(True));
-    LResultObj.AddPair('rowsAffected', TJSONNumber.Create(LRowsAffected));
-    LResultObj.AddPair('statement', Copy(LSqlUpper, 1, Pos(' ', LSqlUpper + ' ') - 1));
+    LRowsAffected := nxmodule.nxQuery1.RowsAffected;
 
-    // Include log output if requested
-    if LHasLog then
-      LResultObj.AddPair('log', LogToJSONArray(nxmodule.nxQuery1.Log));
+    // Build result
+    LResultObj := TJSONObject.Create;
+    try
+      LResultObj.AddPair('success', TJSONBool.Create(True));
+      LResultObj.AddPair('rowsAffected', TJSONNumber.Create(LRowsAffected));
+      LResultObj.AddPair('statement', Copy(LSqlUpper, 1, Pos(' ', LSqlUpper + ' ') - 1));
 
-    Result := LResultObj.ToJSON;
+      // Include log output if requested
+      if LHasLog then
+        LResultObj.AddPair('log', LogToJSONArray(nxmodule.nxQuery1.Log));
+
+      Result := LResultObj.ToJSON;
+    finally
+      LResultObj.Free;
+    end;
   finally
-    LResultObj.Free;
+    LFailureLog.Free;
+    LFailureLog := nil;
   end;
 end;
 

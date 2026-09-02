@@ -17,6 +17,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `sample code\Delphi-MCP-Server-Reference` - MCP Library (reference only)
   - `sample code\NexusDB` - NexusDB examples
   - `sample code\dataset.serialize` - JSON serialization library
+- `DEPENDENCIES.md` - library versions nxmcp is built against, and the dataset-serialize
+  patch a build needs
 
 ## Development Workflow
 
@@ -86,6 +88,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `recover_table` | Attempt to recover records from broken table |
 | `change_password` | Change table password |
 | `get_autoinc_value` | Get next auto-increment value |
+| `close_inactive_tables` | Release the tables *and folders* the server holds in its cache for this session |
 
 ### Transactions (Phase 6)
 | Tool | Description |
@@ -98,7 +101,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `list_tables` | List all user tables in the connected database |
 | `count_records` | Get record count using table metadata (fast, no scan) |
 | `list_indexes` | List all indexes on a table with their fields |
-| `explain_query` | Show query execution plan (standard or verbose mode) |
+| `explain_query` | Show query execution plan (standard or verbose mode). Reads are analysed without being run; writes run in an always-rolled-back transaction — see "There is no EXPLAIN" |
+| `list_locks` | Live lock state from `#TABLE_LOCKS` / `#TRANSACTION_LOCKS`; absent meta tables reported, not raised |
 
 ### Database Management (Phase 8)
 | Tool | Description |
@@ -107,21 +111,86 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `switch_database` | Switch the active database by `aliasName` **or** `aliasPath` (keeps session) |
 | `switch_server` | Switch server connection (full reconnect): `mode` remote/embedded; optional `aliasName`/`aliasPath` |
 
+### Lock Inspection and Cache Release
+`list_locks` reads the two **reserved (virtual) meta tables** the server populates on demand: `#TABLE_LOCKS` (record/cursor-level locks — `LOCK_TYPE`, `REFNR`, `WAITING`) and `#TRANSACTION_LOCKS` (transaction-level — `LOCK_STATE`, `EXCLUSIVE`, `TRANSACTION_LEVEL`, `RUNNING_FOR`). Both are defined in `nxsqlProxies.pas` and were **added in a later NexusDB release**, so `list_locks` must not raise on an older server.
+
+Graceful degradation works by *asking the server*, not by trusting the constants compiled into nxmcp: when the `SELECT * FROM #<table>` fails, `ServerKnowsMetaTable` reads `SELECT METATABLE_NAME FROM #META`, which enumerates `ReservedTableNames` **as implemented by the SQL engine that ran the query**. In remote mode that engine lives in `nxServer.exe`, whose version is independent of this client — a client-side check would be wrong there. Only a name genuinely missing from `#META` yields `"available": false` plus an explanation; anything else (permissions, dead socket, …) is re-raised. If the `#META` probe itself fails, it returns `True` so the *original* error surfaces rather than a bogus "your server is too old". `list_locks` needs the SQL engine and therefore `EnsureConnection`. Row keys are lower-camel-cased by `dataset.serialize` (`TABLE_NAME` → `tableName`).
+
+`close_inactive_tables` calls `nxSession1.CloseInactiveTables` **then** `CloseInactiveFolders` (that order — a folder cannot be released while one of its tables is still open; the EnterpriseManager does the same two calls in the same order). It closes `nxQuery1`/`nxTable1` first, since our own active cursors would otherwise survive the sweep. It uses **`EnsureSession`, not `EnsureConnection`**: the cache belongs to the session, and freeing server-side file handles is most useful exactly when the current database will not open — requiring a healthy database would block the cleanup that fixes it.
+
 ### Logging
 `[Options] LogToFile` (default off) enables file logging; `[Options] LogFileName` overrides the path. **Leave `LogFileName` empty**: `Tnxmodule.ConfigureLogging` then derives `<exe name>.<pid>.log`, one file per process.
+
+NexusDB also installs its own exception hook during unit initialization, before the nxmcp
+program body runs. By default it creates a per-executable application-home directory below
+`C:\ProgramData\NexusDB4\nxmcp\<encoded executable directory>`. Standard Windows ACLs
+normally permit this, but restricted runners and sandboxes may block the write. Always run
+relocated diagnostic copies in such environments with a writable NexusDB application home,
+for example:
+
+```text
+nxmcp.exe /CONFIG:"C:\projects\nxmcp\temp\nxmcp-state"
+```
+
+`/CONFIG:` affects NexusDB's application-data and exception-log location only; nxmcp still
+loads `nxmcp.ini` beside the executable. A failure here occurs before `nxmcp.dpr` can catch or
+log it: the primary symptom is runtime error 217. A later access violation in
+`System.TMonitor.Enter` is secondary finalization damage, not evidence that embedded
+connection startup was reached. Do not launch a configuration matrix until a remote
+`AutoConnect=0` control starts successfully with the same `/CONFIG:` override.
 
 File logging is implemented in `nxmcp.FileLog.pas`, **not** by `TLogger.LogToFile` — `ConfigureLogging` explicitly sets `TLogger.LogToFile := False` and hooks `TLogger.OnLogMessage` instead. Do not turn `TLogger.LogToFile` back on. The library's `EnsureLogFile` opens the log through `TStreamWriter.Create(FileName, ...)`, which passes no share bits (exclusive handle) and lets an open failure escape as an exception. Under the STDIO transport *every MCP client spawns its own `nxmcp.exe`* — Claude Code and Claude Desktop routinely run concurrently — so the second instance could not open the shared log and died before its transport started, which the client reports as "MCP server exited immediately".
 
 `nxmcp.FileLog` instead opens `fmShareDenyWrite` (editors and `tail` can read the log while nxmcp holds it), appends, and is fail-soft: an unopenable or unwritable log emits a `[WARN ] File logging disabled` line on **stderr** (never stdout, which carries JSON-RPC) and the server continues console-only. Setting an explicit `LogFileName` shared by two concurrent instances is therefore safe but pointless — the loser silently drops to console-only.
 
-### Connection Recovery: EnsureConnection vs EnsureSession vs ExecuteWithReconnect
+### Concurrency and Connection Recovery
+
+One process currently owns one mutable NexusDB session. HTTP dispatch is concurrent, so the
+tool and resource managers are wrapped at startup as:
+
+```text
+FilterTools(SerializeTools(TMCPToolsManager.Create, SharedGate), IsToolEnabled)
+FilterResources(SerializeResources(TMCPResourcesManager.Create, SharedGate), IsResourceEnabled)
+```
+
+The filter must remain outermost, and both serialized managers must receive the same gate.
+Only `tools/call` and `resources/read` acquire it. `tools/list`, `resources/list`,
+`resources/templates/list`, core methods such as `initialize`, and `ping` bypass it.
+`[Options] BusyTimeout` bounds acquisition independently of the database `Timeout`; `0`
+fails fast and negative configured values fall back to 3000 ms. Never log request arguments,
+SQL, passwords, or result data while diagnosing contention—only the tool name/resource URI
+and wait duration.
+
+Every server round-trip must declare a retry policy. Use `ExecuteWithReconnect` only where
+replaying the action is part of the existing contract. Use `ExecuteWithoutRetry` for DDL,
+restructure, maintenance, password, and other ambiguous writes. Transaction and switch code
+may retain a documented state machine, but it must call `RecoverSessionAfterError` for a
+poisoned-session failure before returning. Pure local component property access needs no
+round-trip boundary after connection establishment.
+
 `nxSession1.Active` and `nxDatabase1.Connected` are **client-side flags**: after the server dies or the socket drops they both still report `True`, and only the next server round-trip reveals the truth. Recovery therefore needs two mechanisms, and most tools use both.
 
 | Helper | Guarantees | Use when |
 |--------|-----------|----------|
 | `EnsureConnection` | session **and** database open (`Reconnect` = `ForceDisconnect` + `Connect`) | the tool needs the *current* database — the 36 data/schema tools |
 | `EnsureSession` | session/transport/engine only, **database left closed** | the tool is server-level and must survive a database that won't open: `list_aliases`, `switch_database` |
-| `ExecuteWithReconnect` | catches `DBIERR_SERVERCOMMLOST` (`$2C0C`), reconnects, retries the action **once** | wraps the actual round-trip; the only way to detect a stale-but-`Active` handle |
+| `ExecuteWithReconnect` | recovers communication loss/re-entry and retries once; reports a timeout without retry | replay-safe round-trips |
+| `ExecuteWithoutRetry` | recovers a poisoned session but always reports the original failure | ambiguous writes, DDL/restructure, maintenance and password changes |
+| `RecoverSessionAfterError` | classifies, best-effort cancels timeout/re-entry, fully retires and reconnects | transaction/switch state machines that catch the exception themselves |
+
+Recovery policy:
+
+| NexusDB failure | Retry-enabled boundary | No-retry boundary | Session action |
+|---|---|---|---|
+| `DBIERR_SERVERCOMMLOST` | retry once | report original error | retire and reconnect |
+| `DBIERR_REENTERED` | retry once | report original error | cancel best-effort, retire and reconnect |
+| `DBIERR_NX_GENERALTIMEOUT` | never retry | never retry | cancel best-effort, retire and reconnect |
+| Other | never retry | never retry | leave session alone unless the owning state machine requires cleanup |
+
+Classification lives in `nxmcp.NexusErrors.pas` and must recognize both NexusDB exception
+families (`EnxDatabaseError` and `EnxBaseException`). The attempt loop classifies failures
+from the retry as well as the first call. Cleanup/reconnect failure is logged but must never
+mask the original operation exception.
 
 Rules:
 - **Never call `EnsureConnection`/`EnsureSession` in `switch_server` or `SwitchToEmbedded`.** The server being switched away from is frequently the one that is down — that is *why* the caller is switching. Requiring the old connection to be healthy turns the escape hatch into a deadlock.
@@ -139,7 +208,7 @@ The `[Connection] Mode` ini key (or `switch_server`'s `mode` param) selects how 
 
 `Connect` branches to `ConnectRemote`/`ConnectEmbedded`; `Disconnect`/`ForceDisconnect` deactivate *both* engines so the components not in use are always `Active := False`. `WireServerEngine` (re)points the session at the mode's engine (session must be closed). Runtime switch: `switch_server mode="embedded" aliasPath=...` → `dmnx.SwitchToEmbedded`; `mode="remote" ...` → `dmnx.SwitchServer` (a mode change does a full reconnect with rollback and sets `FServerMode`; embedded→embedded only switches the database, see the rules above). `switch_database` by `aliasName` is rejected while embedded (path only). `IsEmbedded`/`ServerMode` expose the state; `Tnxmodule.ModeToStr`/`StrToMode` parse `Remote`/`Embedded`.
 
-> **Win64 build note (embedded SQL):** NexusDB's SQL tokenizer had a 64-bit pointer-truncation bug at `nxSQLTok.pas:1235` (`EndPtr := PWideChar(DWord(CurPtr) + ...)` — `DWord` is 32-bit). It only bites the **in-process** engine on Win64 (remote tokenizes in the 32-bit `nxServer.exe`), yielding `Invalid token: error at line 1 pos 1` for every embedded query. Fixed to `NativeUInt(CurPtr)`. Anyone rebuilding embedded on Win64 needs this fix in the NexusDB source.
+> **Win64 build note (embedded SQL):** an older NexusDB revision truncated a pointer through a 32-bit `DWord` in the SQL tokenizer, so every embedded query on Win64 failed with `Invalid token: error at line 1 pos 1` (remote is unaffected — it tokenizes in the 32-bit `nxServer.exe`). Reported by a contributor building embedded support in July 2026. **Fixed in 4.75**, which uses the pointer-sized `TnxMemSize` at `nxSQLTok.pas:1213`; no patch needed there or later.
 
 > **Stale-library build note (embedded switch AV):** a July 2026 beta build crashed with `Access violation ... Read of address 0000000000000010` on the *second* embedded engine activation in one process (`switch_server mode="embedded"`, any target path), after which the exception hook set `_FatalException` and every call failed with "suspended until the server is restarted". The crash is a NexusDB library bug in pre-2026-07-09 `nexusdb4` sources; it is not reproducible when built against the library from 2026-07-13 or later (verified by driving `dmnx.pas` through the exact scenario, cross-thread, valid and invalid paths). If that signature ever reappears, first check which library revision the exe was built against — and note nxmcp now avoids the engine bounce entirely for embedded→embedded switches anyway.
 
@@ -224,16 +293,67 @@ Prefix SQL with switches to control execution:
 | `#L` | `#L+` / `#L-` | Query logging: plan summary, index used, join strategy |
 | `#V` | `#V+` / `#V-` | Verbose logging: full optimizer decisions, all indexes considered, relation analysis |
 | `#T` | `#T 5000` | Timeout in milliseconds |
+| `#OPT` | `#OPT::STATEMENT::NO_PROCESSING='1'` | Set a server-side option; see below |
+
+`compPROD_nxSQL` (`nxSQLParse.pas`) loops over the switch kinds, so any number of them may be
+prefixed in any order — `#L+ #OPT::… #I- SELECT …` is one statement, not a batch.
+
+**`#OPT::<group>::<name>='<value>'`** sets an engine option, where `<group>` is `STATEMENT`,
+`DATABASE`, `TRANSCONTEXT` or `SESSION`. The one nxmcp uses is `NO_PROCESSING='1'` — the closest
+thing NexusDB has to an EXPLAIN, see below. Note the scope: `SESSION`/`DATABASE` options outlive
+the statement, which is why `StripSwitches` deliberately does **not** strip `#OPT` — leaving it in
+makes `AnalyzeSql` classify the input as `skOther`, so no caller can smuggle an option through the
+SQL of a tool that promises to read.
 
 ```pascal
-// Example: Get execution plan
-nxQuery1.SQL.Text := '#L+ SELECT * FROM Orders WHERE Status = ''Active''';
-nxQuery1.Prepare;
-// nxQuery1.Log now contains execution plan
+// Example: Get the execution plan for a read WITHOUT reading any rows
+nxQuery1.SQL.Text := '#L+ #OPT::STATEMENT::NO_PROCESSING=''1'' ' +
+                     'SELECT * FROM Orders WHERE Status = ''Active''';
+nxQuery1.Open;   // NOT Prepare - see below; Open returns an empty result set
+// nxQuery1.Log now contains the plan
 
 // Example: Disable index optimization for testing
 nxQuery1.SQL.Text := '#I- SELECT * FROM LargeTable WHERE ID > 100';
 ```
+
+### There is no EXPLAIN, and no query plan object either (verified in the engine source)
+Checked against the installed NexusDB tree in `C:\ProgramData\NexusDB\NexusDB4` (a hidden
+directory — it is on the compiler's unit path but easy to miss when searching for sources), and
+confirmed by the NexusDB lead developer.
+
+* **No EXPLAIN anywhere.** No such keyword in the grammar, no `GetPlan`/`QueryPlan` symbol.
+* **There is no plan artifact.** `TnxSqlRowBuilder.Optimize` records its decisions in the row
+  builder's own state (index choice, join strategy, `WasOptimized`/`FullyOptimized`) and merely
+  *narrates* them via `LogNormal`/`LogVerbose` into a `TnxSqlLogList` — a plain string list. There
+  is nothing to serialize, which is why there is nothing to EXPLAIN.
+* **`Prepare` does not produce it.** `TnxSqlStatement.ssPrepare` (`nxsqlEngine.pas:592`) only
+  parses and binds; the only thing it ever writes to its stream is an error message. The optimizer
+  runs inside execution — `Optimize` is called at the top of `TnxSqlRowBuilder.Execute`
+  (`nxsqlTableExp.pas:7437`).
+* **The log ships only in the exec reply.** `TnxSqlStatement.Exec` writes `LogList` into the exec
+  stream and then clears it (`nxsqlEngine.pas:463-477`); the client reads `sdLog` exclusively from
+  `ExecStream` (`nxdb.pas:20683-20694`) and never looks at the prepare stream. So `Prepare` alone
+  always leaves `Log` empty.
+* **A failed statement still returns its plan.** The engine attaches the log to the exception as
+  `nxeCustomInfo('SqlLog', …)` (`nxsqlEngine.pas:499`) and the client falls back to it when the
+  normal path yielded nothing (`nxdb.pas:20714`). That is why `get_query_log` works after a
+  timeout.
+
+**`NO_PROCESSING` is the engine's answer for reads.** With the option set,
+`TnxSqlRowBuilder.ReadSources` (`nxsqlTableExp.pas:4048`) returns immediately while `Optimize` —
+and therefore the whole `#L+`/`#V+` narration — still runs: parsed, bound, optimized, zero rows
+read. Two adapters shipped in NexusDB's own `Bonus\` folder (DevExpress Server Mode, ReportBuilder
+DADE) use it to fetch a query's metadata without its data.
+
+**It refuses writes.** INSERT/UPDATE/DELETE/COMMIT raise `'… not supported in no processing mode'`
+at the top of their `Execute` (`nxsqlDataManip.pas:560/1049/1391/1972`), as does all DDL
+(`nxsqlDataDef.pas`). So `explain_query` needs two strategies, and has them:
+
+| Statement | Strategy | Response |
+|---|---|---|
+| SELECT (no INTO) | `#OPT::STATEMENT::NO_PROCESSING='1'` — optimizer runs, row loop does not | `executed: false` |
+| INSERT/UPDATE/DELETE, SELECT … INTO | really executed, inside a transaction that is always rolled back | `executed: true`, `rolledBack: true` |
+| DDL | rejected — not transactional, and no-processing refuses it too | — |
 
 ### Transaction API
 NexusDB transactions are managed via `TnxDatabase`:

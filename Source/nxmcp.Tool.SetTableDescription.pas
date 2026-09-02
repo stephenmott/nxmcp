@@ -58,6 +58,7 @@ var
   LCompleted: Boolean;
   LTaskStatus: TnxTaskStatus;
 begin
+  try
   if Trim(Params.TableName) = '' then
     raise Exception.Create('Table name cannot be empty');
 
@@ -128,6 +129,14 @@ begin
     Result := LResultObj.ToJSON;
   finally
     LResultObj.Free;
+  end;
+  except
+    on E: Exception do
+    begin
+      if Assigned(nxmodule) then
+        nxmodule.RecoverSessionAfterError(E);
+      raise;
+    end;
   end;
 end;
 

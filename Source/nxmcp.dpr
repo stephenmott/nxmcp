@@ -29,6 +29,8 @@ uses
   MCPServer.ResourcesManager,
   dmnx in 'dmnx.pas' {nxmodule: TDataModule},
   nxmcp.FileLog in 'nxmcp.FileLog.pas',
+  nxmcp.CapabilityFilter in 'nxmcp.CapabilityFilter.pas',
+  nxmcp.SerializedManager in 'nxmcp.SerializedManager.pas',
   nxmcp.FieldTypes in 'nxmcp.FieldTypes.pas',
   nxmcp.ColumnSpec in 'nxmcp.ColumnSpec.pas',
   nxmcp.SqlUtils in 'nxmcp.SqlUtils.pas',
@@ -70,6 +72,7 @@ uses
   nxmcp.Tool.RecoverTable in 'nxmcp.Tool.RecoverTable.pas',
   nxmcp.Tool.ChangePassword in 'nxmcp.Tool.ChangePassword.pas',
   nxmcp.Tool.GetAutoIncValue in 'nxmcp.Tool.GetAutoIncValue.pas',
+  nxmcp.Tool.CloseInactiveTables in 'nxmcp.Tool.CloseInactiveTables.pas',
   // Phase 6 - Transactions
   nxmcp.Tool.BatchExecute in 'nxmcp.Tool.BatchExecute.pas',
   // Phase 7 - Utility
@@ -77,6 +80,7 @@ uses
   nxmcp.Tool.CountRecords in 'nxmcp.Tool.CountRecords.pas',
   nxmcp.Tool.ListIndexes in 'nxmcp.Tool.ListIndexes.pas',
   nxmcp.Tool.ExplainQuery in 'nxmcp.Tool.ExplainQuery.pas',
+  nxmcp.Tool.ListLocks in 'nxmcp.Tool.ListLocks.pas',
   // Phase 8 - Database Management
   nxmcp.Tool.ListAliases in 'nxmcp.Tool.ListAliases.pas',
   nxmcp.Tool.SwitchDatabase in 'nxmcp.Tool.SwitchDatabase.pas',
@@ -193,13 +197,30 @@ begin
 end;
 
 procedure CreateManagerRegistry;
+var
+  LExecutionGate: INxExecutionGate;
 begin
   Settings := TMCPSettings.Create(nxmodule.GetConfigPath);
   ManagerRegistry := TMCPManagerRegistry.Create;
   CoreManager := TMCPCoreManager.Create(Settings);
   ManagerRegistry.RegisterManager(CoreManager);
-  ManagerRegistry.RegisterManager(TMCPToolsManager.Create);
-  ManagerRegistry.RegisterManager(TMCPResourcesManager.Create);
+  LExecutionGate := CreateExecutionGate;
+  // Wrapped so that anything switched off in [Tools] / [Resources] is neither
+  // listed nor callable. Everything is on unless the ini says otherwise.
+  ManagerRegistry.RegisterManager(
+    FilterTools(SerializeTools(TMCPToolsManager.Create, LExecutionGate,
+      Cardinal(nxmodule.BusyTimeout)),
+      function(const AName: string): Boolean
+      begin
+        Result := nxmodule.IsToolEnabled(AName);
+      end));
+  ManagerRegistry.RegisterManager(
+    FilterResources(SerializeResources(TMCPResourcesManager.Create, LExecutionGate,
+      Cardinal(nxmodule.BusyTimeout)),
+      function(const AURI: string): Boolean
+      begin
+        Result := nxmodule.IsResourceEnabled(AURI);
+      end));
 end;
 
 procedure RunHTTPServer;

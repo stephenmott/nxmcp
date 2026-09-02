@@ -69,12 +69,12 @@ begin
       nxmodule.nxTable1.Close;
       nxmodule.nxTable1.TableName := Params.TableName;
       nxmodule.nxTable1.Open;
+      try
+        LRecordCount := nxmodule.nxTable1.RecordCount;
+      finally
+        nxmodule.nxTable1.Close;
+      end;
     end);
-  try
-    LRecordCount := nxmodule.nxTable1.RecordCount;
-  finally
-    nxmodule.nxTable1.Close;
-  end;
 
   // Build result
   LResultObj := TJSONObject.Create;

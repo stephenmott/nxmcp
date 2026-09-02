@@ -52,6 +52,7 @@ uses
   Data.DB,
   DataSet.Serialize,
   MCPServer.Registration,
+  nxmcp.SqlUtils,
   dmnx;
 
 { TGetTableDataTool }
@@ -66,6 +67,7 @@ end;
 
 function TGetTableDataTool.ExecuteWithParams(const Params: TGetTableDataParams): string;
 var
+  LResult: string;
   LResultObj: TJSONObject;
   LJSONArray: TJSONArray;
   LMaxRows: Integer;
@@ -73,9 +75,13 @@ var
   LSql: string;
   LRowCount: Integer;
 begin
-  // Validate parameters
-  if Trim(Params.TableName) = '' then
-    raise Exception.Create('Table name cannot be empty');
+  // The names are concatenated into the SQL below, and NexusDB has no escape for
+  // a quote inside a quoted identifier - so validate against the engine's own
+  // rules instead. '"' and ';' are not legal identifier characters, which is what
+  // stops a crafted name from closing the quote and appending a second statement.
+  CheckTableName(Params.TableName);
+  if Trim(Params.OrderBy) <> '' then
+    CheckIdentifier(Params.OrderBy, 'orderBy column');
 
   // Determine limits
   if Params.MaxRows > 0 then
@@ -94,77 +100,96 @@ begin
   if Trim(Params.OrderBy) <> '' then
     LSql := LSql + ' ORDER BY "' + Params.OrderBy + '"';
 
-  // Execute query (auto-reconnects and retries once on lost connection)
+  LResultObj := nil;
+  LJSONArray := nil;
+  LResult := '';
+
+  // Keep the complete cursor round-trip in one retryable action.  Any cursor
+  // operation can be the first one to report a dead NexusDB connection after
+  // Open succeeded, so none of them may sit outside ExecuteWithReconnect.
   nxmodule.ExecuteWithReconnect(
     procedure
     begin
-      nxmodule.nxQuery1.Close;
-      nxmodule.nxQuery1.SQL.Text := LSql;
-      nxmodule.nxQuery1.Open;
-    end);
-
-  try
-    // Skip to offset
-    nxmodule.nxQuery1.First;
-    while (LOffset > 0) and not nxmodule.nxQuery1.Eof do
-    begin
-      Dec(LOffset);
-      nxmodule.nxQuery1.Next;
-    end;
-
-    // Count available rows from current position
-    LRowCount := 0;
-    while not nxmodule.nxQuery1.Eof do
-    begin
-      Inc(LRowCount);
-      if LRowCount >= LMaxRows then
-        Break;
-      nxmodule.nxQuery1.Next;
-    end;
-
-    // Reset to offset position and export
-    nxmodule.nxQuery1.First;
-    LOffset := Max(0, Params.Offset);
-    while (LOffset > 0) and not nxmodule.nxQuery1.Eof do
-    begin
-      Dec(LOffset);
-      nxmodule.nxQuery1.Next;
-    end;
-
-    // Build JSON array manually with limit
-    LJSONArray := TJSONArray.Create;
-    try
-      LRowCount := 0;
-      while not nxmodule.nxQuery1.Eof do
-      begin
-        if LRowCount >= LMaxRows then
-          Break;
-        LJSONArray.AddElement(nxmodule.nxQuery1.ToJSONObject);
-        Inc(LRowCount);
-        nxmodule.nxQuery1.Next;
-      end;
-
-      // Build result
-      LResultObj := TJSONObject.Create;
-      try
-        LResultObj.AddPair('tableName', Params.TableName);
-        LResultObj.AddPair('rowCount', TJSONNumber.Create(LRowCount));
-        LResultObj.AddPair('maxRows', TJSONNumber.Create(LMaxRows));
-        LResultObj.AddPair('offset', TJSONNumber.Create(Max(0, Params.Offset)));
-        LResultObj.AddPair('hasMore', TJSONBool.Create(not nxmodule.nxQuery1.Eof));
-        LResultObj.AddPair('data', LJSONArray);
-        Result := LResultObj.ToJSON;
-      except
-        LResultObj.Free;
-        raise;
-      end;
-    except
+      // Reset all attempt state before rebuilding the cursor and payload.  In
+      // particular, LOffset is consumed by the first pagination pass.
+      LResult := '';
+      LResultObj.Free;
+      LResultObj := nil;
       LJSONArray.Free;
-      raise;
-    end;
-  finally
-    nxmodule.nxQuery1.Close;
-  end;
+      LJSONArray := nil;
+      LOffset := Max(0, Params.Offset);
+      LRowCount := 0;
+
+      nxmodule.nxQuery1.Close;
+      try
+        nxmodule.nxQuery1.SQL.Text := LSql;
+        nxmodule.nxQuery1.Open;
+
+        // Skip to offset
+        nxmodule.nxQuery1.First;
+        while (LOffset > 0) and not nxmodule.nxQuery1.Eof do
+        begin
+          Dec(LOffset);
+          nxmodule.nxQuery1.Next;
+        end;
+
+        // Count available rows from current position
+        LRowCount := 0;
+        while not nxmodule.nxQuery1.Eof do
+        begin
+          Inc(LRowCount);
+          if LRowCount >= LMaxRows then
+            Break;
+          nxmodule.nxQuery1.Next;
+        end;
+
+        // Reset to offset position and export
+        nxmodule.nxQuery1.First;
+        LOffset := Max(0, Params.Offset);
+        while (LOffset > 0) and not nxmodule.nxQuery1.Eof do
+        begin
+          Dec(LOffset);
+          nxmodule.nxQuery1.Next;
+        end;
+
+        // Build JSON array manually with limit
+        LJSONArray := TJSONArray.Create;
+        try
+          LRowCount := 0;
+          while not nxmodule.nxQuery1.Eof do
+          begin
+            if LRowCount >= LMaxRows then
+              Break;
+            LJSONArray.AddElement(nxmodule.nxQuery1.ToJSONObject);
+            Inc(LRowCount);
+            nxmodule.nxQuery1.Next;
+          end;
+
+          // Build result
+          LResultObj := TJSONObject.Create;
+          try
+            LResultObj.AddPair('tableName', Params.TableName);
+            LResultObj.AddPair('rowCount', TJSONNumber.Create(LRowCount));
+            LResultObj.AddPair('maxRows', TJSONNumber.Create(LMaxRows));
+            LResultObj.AddPair('offset', TJSONNumber.Create(Max(0, Params.Offset)));
+            LResultObj.AddPair('hasMore', TJSONBool.Create(not nxmodule.nxQuery1.Eof));
+            LResultObj.AddPair('data', LJSONArray);
+            // Ownership of the array now belongs to the object.
+            LJSONArray := nil;
+            LResult := LResultObj.ToJSON;
+          finally
+            LResultObj.Free;
+            LResultObj := nil;
+          end;
+        finally
+          LJSONArray.Free;
+          LJSONArray := nil;
+        end;
+      finally
+        nxmodule.nxQuery1.Close;
+      end;
+    end);
+  Result := LResult;
 end;
 
 initialization

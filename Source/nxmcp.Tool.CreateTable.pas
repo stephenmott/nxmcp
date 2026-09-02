@@ -82,6 +82,7 @@ var
   LCompleted: Boolean;
   LTaskStatus: TnxTaskStatus;
 begin
+  try
   nxmodule.nxSession1.CloseInactiveTables;
 
   LOldDict := TnxDataDictionary.Create;
@@ -124,6 +125,13 @@ begin
     end;
   finally
     LOldDict.Free;
+  end;
+  except
+    on E: Exception do
+    begin
+      nxmodule.RecoverSessionAfterError(E);
+      raise;
+    end;
   end;
 end;
 
@@ -195,8 +203,9 @@ begin
       // Reconcile field setup/offsets after any required-flag changes
       LDict.FieldsDescriptor.UpdateSetupAndOffsets;
 
-      // Create the table (auto-reconnects and retries once on lost connection)
-      nxmodule.ExecuteWithReconnect(
+      // Creating a table is deliberately never replayed after an ambiguous
+      // transport failure.
+      nxmodule.ExecuteWithoutRetry(
         procedure
         begin
           nxmodule.nxDatabase1.CreateTable(False, Params.TableName, '', LDict);

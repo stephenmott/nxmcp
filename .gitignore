@@ -65,6 +65,12 @@ __recovery/
 # Castalia statistics file (since XE7 Castalia is distributed with Delphi)
 *.stat
 
+# Build output directories. Source/Win64/*/nxmcp.ini is generated on first run
+# and holds the [Authentication] credentials - never commit it.
+Source/Win32/
+Source/Win64/
+*.log
+
 # In repo for agent use and reference, not to be committed:
 plan/
 sample code/

@@ -67,13 +67,11 @@ begin
   if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
-  // Close any open tables to avoid conflicts
-  nxmodule.nxSession1.CloseInactiveTables;
-
-  // Change password (auto-reconnects and retries once on lost connection)
-  nxmodule.ExecuteWithReconnect(
+  // Password changes must not be replayed after an ambiguous transport failure.
+  nxmodule.ExecuteWithoutRetry(
     procedure
     begin
+      nxmodule.nxSession1.CloseInactiveTables;
       nxCheck(nxmodule.nxDatabase1.ChangePasswordEx(Params.TableName, Params.OldPassword, Params.NewPassword));
     end);
 

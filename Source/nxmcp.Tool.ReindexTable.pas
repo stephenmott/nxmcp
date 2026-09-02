@@ -71,27 +71,31 @@ begin
   if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
-  // Close any open tables to avoid conflicts
-  nxmodule.nxSession1.CloseInactiveTables;
-
-  // Start reindex operation
-  nxCheck(nxmodule.nxDatabase1.ReIndexTableEx(Params.TableName, nxmodule.TablePassword,
-    Params.IndexName, LTaskInfo));
-
-  // Wait for completion
-  if Assigned(LTaskInfo) then
-  try
-    while True do
+  nxmodule.ExecuteWithoutRetry(
+    procedure
     begin
-      LTaskInfo.GetStatus(LCompleted, LTaskStatus);
-      if LCompleted then
-        Break;
-      Sleep(100);
-    end;
-    nxCheck(LTaskStatus.tsErrorCode);
-  finally
-    LTaskInfo.Free;
-  end;
+      // Close any open tables to avoid conflicts
+      nxmodule.nxSession1.CloseInactiveTables;
+
+      // Start reindex operation
+      nxCheck(nxmodule.nxDatabase1.ReIndexTableEx(Params.TableName,
+        nxmodule.TablePassword, Params.IndexName, LTaskInfo));
+
+      // Wait for completion
+      if Assigned(LTaskInfo) then
+      try
+        while True do
+        begin
+          LTaskInfo.GetStatus(LCompleted, LTaskStatus);
+          if LCompleted then
+            Break;
+          Sleep(100);
+        end;
+        nxCheck(LTaskStatus.tsErrorCode);
+      finally
+        LTaskInfo.Free;
+      end;
+    end);
 
   // Build result
   LResultObj := TJSONObject.Create;

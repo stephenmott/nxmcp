@@ -49,6 +49,7 @@ uses
   System.Generics.Collections,
   nxsdTypes,
   MCPServer.Registration,
+  nxmcp.SqlUtils,
   dmnx,
   nxmcp.ValueFormat;
 
@@ -73,8 +74,7 @@ var
   LFieldTypes: TDictionary<string, TnxFieldType>;
 begin
   // Validate parameters
-  if Trim(Params.TableName) = '' then
-    raise Exception.Create('Table name cannot be empty');
+  CheckTableName(Params.TableName);
 
   if Trim(Params.Data) = '' then
     raise Exception.Create('Data cannot be empty');
@@ -113,6 +113,10 @@ begin
         if LSetClause <> '' then
           LSetClause := LSetClause + ', ';
 
+        // The JSON key becomes a quoted column name in the SQL - same escaping
+        // problem as the table name, same fix.
+        CheckIdentifier(LPair.JsonString.Value, 'column name');
+
         LSetClause := LSetClause + '"' + LPair.JsonString.Value + '" = ' +
           FormatJsonValueAsSql(LPair.JsonString.Value, LPair.JsonValue, LFieldTypes);
       end;
@@ -121,6 +125,10 @@ begin
     end;
 
     LSql := 'UPDATE "' + Params.TableName + '" SET ' + LSetClause + ' WHERE ' + Params.WhereClause;
+
+    // Keep the update confined to the named table while leaving the WHERE clause
+    // fully expressive: a subselect adds no top-level semicolon and passes.
+    CheckSingleStatement(LSql, 'WHERE clause');
 
     // Execute (auto-reconnects and retries once on lost connection;
     // UPDATE with the same WHERE clause is generally safe to repeat)

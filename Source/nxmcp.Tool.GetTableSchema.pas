@@ -36,6 +36,7 @@ uses
   nxsdDataDictionaryStrings,
   nxllException,
   MCPServer.Registration,
+  nxmcp.SqlUtils,
   dmnx,
   nxmcp.FieldTypes;
 
@@ -233,8 +234,9 @@ var
   LRecordCount: Integer;
   I, J: Integer;
 begin
-  if Trim(Params.TableName) = '' then
-    raise Exception.Create('Table name cannot be empty');
+  // The name reaches a concatenated SELECT COUNT(*) further down, so validate it
+  // against NexusDB's own identifier rules before it gets there.
+  CheckTableName(Params.TableName);
 
   if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
@@ -338,15 +340,31 @@ begin
     end;
 
     // Record count (from SQL)
-    nxmodule.nxQuery1.Close;
-    nxmodule.nxQuery1.SQL.Text := 'SELECT COUNT(*) FROM "' + Params.TableName + '"';
     try
-      nxmodule.nxQuery1.Open;
-      LRecordCount := nxmodule.nxQuery1.Fields[0].AsInteger;
+      nxmodule.ExecuteWithReconnect(
+        procedure
+        begin
+          nxmodule.nxQuery1.Close;
+          nxmodule.nxQuery1.SQL.Text := 'SELECT COUNT(*) FROM "' + Params.TableName + '"';
+          nxmodule.nxQuery1.Open;
+          try
+            LRecordCount := nxmodule.nxQuery1.Fields[0].AsInteger;
+          finally
+            nxmodule.nxQuery1.Close;
+          end;
+        end);
     except
-      LRecordCount := -1;
+      on E: Exception do
+      begin
+        // ExecuteWithReconnect retires the session before re-raising a timeout,
+        // re-entry, or communication-loss failure. Do not hide that poisoned
+        // session outcome behind the optional -1 record-count fallback.
+        if Tnxmodule.IsTimeoutError(E) or Tnxmodule.IsReenteredError(E) or
+          Tnxmodule.IsConnectionLostError(E) then
+          raise;
+        LRecordCount := -1;
+      end;
     end;
-    nxmodule.nxQuery1.Close;
     LResultObj.AddPair('recordCount', TJSONNumber.Create(LRecordCount));
 
     Result := LResultObj.ToJSON;

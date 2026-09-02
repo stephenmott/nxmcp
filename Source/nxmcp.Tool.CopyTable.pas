@@ -78,30 +78,36 @@ begin
   if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
     raise Exception.Create('Not connected to NexusDB');
 
-  // Close any open tables to avoid conflicts
-  nxmodule.nxSession1.CloseInactiveTables;
-
   LRowsCopied := 0;
+  nxmodule.ExecuteWithoutRetry(
+    procedure
+    begin
+      // Close any open tables to avoid conflicts
+      nxmodule.nxSession1.CloseInactiveTables;
 
-  // Get source table dictionary
-  LDict := TnxDataDictionary.Create;
-  try
-    nxCheck(nxmodule.nxDatabase1.GetDataDictionaryEx(Params.SourceTable, nxmodule.TablePassword, LDict));
+      // Get source table dictionary
+      LDict := TnxDataDictionary.Create;
+      try
+        nxCheck(nxmodule.nxDatabase1.GetDataDictionaryEx(Params.SourceTable,
+          nxmodule.TablePassword, LDict));
 
-    // Create the new table with same structure
-    nxmodule.nxDatabase1.CreateTable(False, Params.TargetTable, '', LDict);
-  finally
-    LDict.Free;
-  end;
+        // Create the new table with same structure
+        nxmodule.nxDatabase1.CreateTable(False, Params.TargetTable, '', LDict);
+      finally
+        LDict.Free;
+      end;
 
-  // Copy data if requested
-  if Params.CopyData then
-  begin
-    nxmodule.nxQuery1.Close;
-    nxmodule.nxQuery1.SQL.Text := 'INSERT INTO "' + Params.TargetTable + '" SELECT * FROM "' + Params.SourceTable + '"';
-    nxmodule.nxQuery1.ExecSQL;
-    LRowsCopied := nxmodule.nxQuery1.RowsAffected;
-  end;
+      // Table creation is not transactional, so neither it nor the copy may be
+      // replayed automatically after a communication failure.
+      if Params.CopyData then
+      begin
+        nxmodule.nxQuery1.Close;
+        nxmodule.nxQuery1.SQL.Text := 'INSERT INTO "' + Params.TargetTable +
+          '" SELECT * FROM "' + Params.SourceTable + '"';
+        nxmodule.nxQuery1.ExecSQL;
+        LRowsCopied := nxmodule.nxQuery1.RowsAffected;
+      end;
+    end);
 
   // Build result
   LResultObj := TJSONObject.Create;
