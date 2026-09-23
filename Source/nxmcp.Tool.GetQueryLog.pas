@@ -30,7 +30,7 @@ implementation
 
 uses
   MCPServer.Registration,
-  dmnx;
+  nxmcp.SessionPool;
 
 { TGetQueryLogTool }
 
@@ -39,27 +39,30 @@ begin
   inherited;
   FName := 'get_query_log';
   FTitle := 'Get Query Log';
-  FDescription := 'Return the query log from the most recent query execution. ' +
+  FDescription := 'Return the query log from the most recent query execution that produced one ' +
+                  '(by any client; the log is shared across the pooled sessions). ' +
                   'The log is populated by NexusDB even if the query failed (e.g. timeout). ' +
-                  'Returns an empty log if no query has been executed or if logging was not enabled.';
+                  'Returns an empty log if no query with logging enabled (#L+ / #V+, or a tool''s log option) has run yet.';
 end;
 
 function TGetQueryLogTool.ExecuteWithParams(const Params: TGetQueryLogParams): string;
 var
   LResultObj: TJSONObject;
   LLogArray: TJSONArray;
-  I: Integer;
+  LLog: TArray<string>;
+  LLine: string;
 begin
-  // Check connection
-  if not Assigned(nxmodule) or not nxmodule.EnsureConnection then
-    raise Exception.Create('Not connected to NexusDB');
+  // Read from the pool, not from nxmodule.nxQuery1: this call may be served by a
+  // different pooled session than the query whose log is wanted. No database
+  // round-trip is involved, so no connection is needed.
+  LLog := NexusPool.LastQueryLog;
 
   LResultObj := TJSONObject.Create;
   try
     LLogArray := TJSONArray.Create;
-    for I := 0 to nxmodule.nxQuery1.Log.Count - 1 do
-      LLogArray.Add(nxmodule.nxQuery1.Log[I]);
-    LResultObj.AddPair('lineCount', TJSONNumber.Create(nxmodule.nxQuery1.Log.Count));
+    for LLine in LLog do
+      LLogArray.Add(LLine);
+    LResultObj.AddPair('lineCount', TJSONNumber.Create(Length(LLog)));
     LResultObj.AddPair('log', LLogArray);
     Result := LResultObj.ToJSON;
   finally

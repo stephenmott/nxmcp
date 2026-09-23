@@ -8,20 +8,42 @@ uses
 
 type
   /// <summary>
+  /// Called on the invoking thread right after a slot is handed out (OnEnter) or
+  /// right before it is returned (OnLeave). AExclusive is True when the call holds
+  /// every slot.
+  /// </summary>
+  TNxSlotEvent = reference to procedure(ASlot: Integer; AExclusive: Boolean);
+
+  /// <summary>
+  /// Decides whether a tools/call must run alone (holding every slot) rather than
+  /// on one slot next to other calls. AArguments may be nil.
+  /// </summary>
+  TNxExclusivePredicate = reference to function(const AName: string;
+    const AArguments: TJSONObject): Boolean;
+
+  /// <summary>
   /// One execution gate is shared by the tools and resources managers because
-  /// both ultimately use the same NexusDB session and datasets.
+  /// both draw on the same pool of NexusDB sessions. A gate has SlotCount slots
+  /// (one per pooled session): a shared entry takes one free slot, an exclusive
+  /// entry waits until every slot is free and takes them all. A waiting exclusive
+  /// entry blocks new shared entries so it cannot be starved.
   /// </summary>
   INxExecutionGate = interface
-    ['{77DDA7FC-977D-4D47-A033-AEA03D307952}']
-    function TryEnter(const AOperation: string; ATimeoutMs: Cardinal;
+    ['{5C0B8E61-3F7A-4C1D-9E2B-8A4D6F13C2E7}']
+    function TryEnter(const AOperation: string; AExclusive: Boolean;
+      ATimeoutMs: Cardinal; out ASlot: Integer;
       out ABlockingOperation: string): Boolean;
-    procedure Leave;
+    procedure Leave(ASlot: Integer);
+    function SlotCount: Integer;
   end;
 
-function CreateExecutionGate: INxExecutionGate;
+function CreateExecutionGate(ASlotCount: Integer = 1;
+  const AOnEnter: TNxSlotEvent = nil;
+  const AOnLeave: TNxSlotEvent = nil): INxExecutionGate;
 
 function SerializeTools(const AInner: IMCPCapabilityManager;
-  const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal): IMCPCapabilityManager;
+  const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal;
+  const AIsExclusive: TNxExclusivePredicate = nil): IMCPCapabilityManager;
 
 function SerializeResources(const AInner: IMCPCapabilityManager;
   const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal): IMCPCapabilityManager;
@@ -30,8 +52,10 @@ implementation
 
 uses
   System.SysUtils,
+  System.StrUtils,
   System.Rtti,
   System.Diagnostics,
+  System.Generics.Collections,
   MCPServer.Logger;
 
 type
@@ -40,15 +64,26 @@ type
   TnxExecutionGate = class(TInterfacedObject, INxExecutionGate)
   private
     FLock: TObject;
-    FStateLock: TObject;
-    FActiveOperation: string;
-    function GetActiveOperation: string;
+    // Free slots as a stack: the most recently released slot is handed out next,
+    // so sequential traffic keeps reusing one (already connected) session and the
+    // others are only brought up under real concurrency.
+    FIdle: TList<Integer>;
+    FActive: TArray<string>;
+    FExclusiveHeld: Boolean;
+    FExclusiveWaiting: Integer;
+    FOnEnter: TNxSlotEvent;
+    FOnLeave: TNxSlotEvent;
+    function DescribeActive: string;
+    function WaitRemaining(const AWatch: TStopwatch; ATimeoutMs: Cardinal): Boolean;
+    procedure ReleaseSlot(ASlot: Integer);
   public
-    constructor Create;
+    constructor Create(ASlotCount: Integer; const AOnEnter, AOnLeave: TNxSlotEvent);
     destructor Destroy; override;
-    function TryEnter(const AOperation: string; ATimeoutMs: Cardinal;
+    function TryEnter(const AOperation: string; AExclusive: Boolean;
+      ATimeoutMs: Cardinal; out ASlot: Integer;
       out ABlockingOperation: string): Boolean;
-    procedure Leave;
+    procedure Leave(ASlot: Integer);
+    function SlotCount: Integer;
   end;
 
   TnxSerializedManager = class(TInterfacedObject, IMCPCapabilityManager)
@@ -57,102 +92,205 @@ type
     FGate: INxExecutionGate;
     FBusyTimeoutMs: Cardinal;
     FKind: TnxManagerKind;
+    FIsExclusive: TNxExclusivePredicate;
     FInvokeMethod: string;
     FInvokeParamKey: string;
     function SafeOperationValue(const AValue: string): string;
+    function InvokedName(const Params: TJSONObject): string;
     function OperationDescription(const Params: TJSONObject): string;
-    function BusyMessage(const ABlockingOperation: string): string;
+    function WantsExclusive(const Params: TJSONObject): Boolean;
+    function BusyMessage(const ABlockingOperation: string;
+      AExclusive: Boolean): string;
     function BuildToolBusyResult(const AMessage: string): TValue;
     function BuildResourceBusyResult(const Params: TJSONObject;
       const AMessage: string): TValue;
   public
     constructor Create(const AInner: IMCPCapabilityManager;
       const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal;
-      AKind: TnxManagerKind);
+      AKind: TnxManagerKind; const AIsExclusive: TNxExclusivePredicate);
     function GetCapabilityName: string;
     function HandlesMethod(const Method: string): Boolean;
     function ExecuteMethod(const Method: string;
       const Params: TJSONObject): TValue;
   end;
 
-function CreateExecutionGate: INxExecutionGate;
+function CreateExecutionGate(ASlotCount: Integer;
+  const AOnEnter: TNxSlotEvent; const AOnLeave: TNxSlotEvent): INxExecutionGate;
 begin
-  Result := TnxExecutionGate.Create;
+  Result := TnxExecutionGate.Create(ASlotCount, AOnEnter, AOnLeave);
 end;
 
 function SerializeTools(const AInner: IMCPCapabilityManager;
-  const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal): IMCPCapabilityManager;
+  const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal;
+  const AIsExclusive: TNxExclusivePredicate): IMCPCapabilityManager;
 begin
-  Result := TnxSerializedManager.Create(AInner, AGate, ABusyTimeoutMs, mkTools);
+  Result := TnxSerializedManager.Create(AInner, AGate, ABusyTimeoutMs, mkTools,
+    AIsExclusive);
 end;
 
 function SerializeResources(const AInner: IMCPCapabilityManager;
   const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal): IMCPCapabilityManager;
 begin
-  Result := TnxSerializedManager.Create(AInner, AGate, ABusyTimeoutMs, mkResources);
+  Result := TnxSerializedManager.Create(AInner, AGate, ABusyTimeoutMs,
+    mkResources, nil);
 end;
 
 { TnxExecutionGate }
 
-constructor TnxExecutionGate.Create;
+constructor TnxExecutionGate.Create(ASlotCount: Integer;
+  const AOnEnter, AOnLeave: TNxSlotEvent);
+var
+  I: Integer;
 begin
   inherited Create;
+  if ASlotCount < 1 then
+    raise EArgumentOutOfRangeException.Create('ASlotCount');
   FLock := TObject.Create;
-  FStateLock := TObject.Create;
+  FIdle := TList<Integer>.Create;
+  SetLength(FActive, ASlotCount);
+  // Push in reverse so slot 0 is on top and is handed out first.
+  for I := ASlotCount - 1 downto 0 do
+    FIdle.Add(I);
+  FOnEnter := AOnEnter;
+  FOnLeave := AOnLeave;
 end;
 
 destructor TnxExecutionGate.Destroy;
 begin
-  FStateLock.Free;
+  FIdle.Free;
   FLock.Free;
   inherited;
 end;
 
-function TnxExecutionGate.GetActiveOperation: string;
+function TnxExecutionGate.SlotCount: Integer;
 begin
-  TMonitor.Enter(FStateLock);
-  try
-    Result := FActiveOperation;
-  finally
-    TMonitor.Exit(FStateLock);
-  end;
+  Result := Length(FActive);
+end;
+
+function TnxExecutionGate.DescribeActive: string;
+var
+  LOperation: string;
+begin
+  // Caller holds FLock.
+  Result := '';
+  for LOperation in FActive do
+    if LOperation <> '' then
+    begin
+      if Result <> '' then
+        Result := Result + '; ';
+      Result := Result + LOperation;
+    end;
+end;
+
+function TnxExecutionGate.WaitRemaining(const AWatch: TStopwatch;
+  ATimeoutMs: Cardinal): Boolean;
+var
+  LElapsed: Int64;
+begin
+  // Caller holds FLock and re-checks its condition after every wake-up, so a
+  // spurious or unrelated pulse is harmless.
+  LElapsed := AWatch.ElapsedMilliseconds;
+  if LElapsed >= ATimeoutMs then
+    Exit(False);
+  TMonitor.Wait(FLock, Cardinal(ATimeoutMs - LElapsed));
+  Result := True;
 end;
 
 function TnxExecutionGate.TryEnter(const AOperation: string;
-  ATimeoutMs: Cardinal; out ABlockingOperation: string): Boolean;
+  AExclusive: Boolean; ATimeoutMs: Cardinal; out ASlot: Integer;
+  out ABlockingOperation: string): Boolean;
+var
+  LWatch: TStopwatch;
 begin
-  Result := TMonitor.Enter(FLock, ATimeoutMs);
-  if not Result then
-  begin
-    ABlockingOperation := GetActiveOperation;
-    Exit;
+  ASlot := -1;
+  ABlockingOperation := '';
+  LWatch := TStopwatch.StartNew;
+
+  TMonitor.Enter(FLock);
+  try
+    if AExclusive then
+    begin
+      Inc(FExclusiveWaiting);
+      while FExclusiveHeld or (FIdle.Count < Length(FActive)) do
+        if not WaitRemaining(LWatch, ATimeoutMs) then
+        begin
+          Dec(FExclusiveWaiting);
+          // Shared entries may have been held back only by this waiter.
+          TMonitor.PulseAll(FLock);
+          ABlockingOperation := DescribeActive;
+          Exit(False);
+        end;
+      Dec(FExclusiveWaiting);
+      FExclusiveHeld := True;
+    end
+    else
+      while FExclusiveHeld or (FExclusiveWaiting > 0) or (FIdle.Count = 0) do
+        if not WaitRemaining(LWatch, ATimeoutMs) then
+        begin
+          ABlockingOperation := DescribeActive;
+          Exit(False);
+        end;
+
+    ASlot := FIdle.Last;
+    FIdle.Delete(FIdle.Count - 1);
+    FActive[ASlot] := AOperation;
+    Result := True;
+  finally
+    TMonitor.Exit(FLock);
   end;
 
-  TMonitor.Enter(FStateLock);
-  try
-    FActiveOperation := AOperation;
-  finally
-    TMonitor.Exit(FStateLock);
-  end;
-  ABlockingOperation := '';
+  // Outside the lock: the hook may make server round-trips.
+  if Assigned(FOnEnter) then
+    try
+      FOnEnter(ASlot, AExclusive);
+    except
+      ReleaseSlot(ASlot);
+      raise;
+    end;
 end;
 
-procedure TnxExecutionGate.Leave;
+procedure TnxExecutionGate.Leave(ASlot: Integer);
+var
+  LExclusive: Boolean;
 begin
-  TMonitor.Enter(FStateLock);
+  TMonitor.Enter(FLock);
   try
-    FActiveOperation := '';
+    LExclusive := FExclusiveHeld;
   finally
-    TMonitor.Exit(FStateLock);
+    TMonitor.Exit(FLock);
   end;
-  TMonitor.Exit(FLock);
+
+  try
+    if Assigned(FOnLeave) then
+      FOnLeave(ASlot, LExclusive);
+  except
+    // The slot must come back whatever the hook did, and the tool's own result
+    // must not be replaced by a housekeeping failure.
+    on E: Exception do
+      TLogger.Warning('Releasing NexusDB session slot ' + IntToStr(ASlot) +
+        ' failed: ' + E.Message);
+  end;
+  ReleaseSlot(ASlot);
+end;
+
+procedure TnxExecutionGate.ReleaseSlot(ASlot: Integer);
+begin
+  TMonitor.Enter(FLock);
+  try
+    FActive[ASlot] := '';
+    FIdle.Add(ASlot);
+    FExclusiveHeld := False;
+    TMonitor.PulseAll(FLock);
+  finally
+    TMonitor.Exit(FLock);
+  end;
 end;
 
 { TnxSerializedManager }
 
 constructor TnxSerializedManager.Create(const AInner: IMCPCapabilityManager;
   const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal;
-  AKind: TnxManagerKind);
+  AKind: TnxManagerKind; const AIsExclusive: TNxExclusivePredicate);
 begin
   inherited Create;
   if not Assigned(AInner) then
@@ -164,6 +302,7 @@ begin
   FGate := AGate;
   FBusyTimeoutMs := ABusyTimeoutMs;
   FKind := AKind;
+  FIsExclusive := AIsExclusive;
   case FKind of
     mkTools:
       begin
@@ -188,22 +327,39 @@ begin
   Result := FInner.HandlesMethod(Method);
 end;
 
-function TnxSerializedManager.OperationDescription(
-  const Params: TJSONObject): string;
+function TnxSerializedManager.InvokedName(const Params: TJSONObject): string;
 var
   LValue: TJSONValue;
-  LSafeValue: string;
 begin
-  Result := FInvokeMethod;
+  Result := '';
   if not Assigned(Params) then
     Exit;
   LValue := Params.GetValue(FInvokeParamKey);
   if Assigned(LValue) then
-  begin
-    LSafeValue := SafeOperationValue(LValue.Value);
-    if LSafeValue <> '' then
-      Result := Result + ' ' + LSafeValue;
-  end;
+    Result := LValue.Value;
+end;
+
+function TnxSerializedManager.OperationDescription(
+  const Params: TJSONObject): string;
+var
+  LSafeValue: string;
+begin
+  Result := FInvokeMethod;
+  LSafeValue := SafeOperationValue(InvokedName(Params));
+  if LSafeValue <> '' then
+    Result := Result + ' ' + LSafeValue;
+end;
+
+function TnxSerializedManager.WantsExclusive(const Params: TJSONObject): Boolean;
+var
+  LArguments: TJSONObject;
+begin
+  if (FKind <> mkTools) or not Assigned(FIsExclusive) then
+    Exit(False);
+  LArguments := nil;
+  if Assigned(Params) and (Params.GetValue('arguments') is TJSONObject) then
+    LArguments := TJSONObject(Params.GetValue('arguments'));
+  Result := FIsExclusive(InvokedName(Params), LArguments);
 end;
 
 function TnxSerializedManager.SafeOperationValue(const AValue: string): string;
@@ -219,14 +375,27 @@ begin
 end;
 
 function TnxSerializedManager.BusyMessage(
-  const ABlockingOperation: string): string;
+  const ABlockingOperation: string; AExclusive: Boolean): string;
 begin
-  Result := Format(
-    'NexusDB is busy processing another request; no database operation was started ' +
-    'after waiting %d ms. Retry after it completes or increase [Options] BusyTimeout.',
-    [FBusyTimeoutMs]);
+  if AExclusive then
+    Result := Format(
+      'NexusDB is busy: this operation needs exclusive use of all %d pooled ' +
+      'sessions and other requests were still running after %d ms; no database ' +
+      'operation was started. Retry after they complete or increase [Options] ' +
+      'BusyTimeout.', [FGate.SlotCount, FBusyTimeoutMs])
+  else if FGate.SlotCount > 1 then
+    Result := Format(
+      'NexusDB is busy: all %d pooled sessions were still in use after %d ms; ' +
+      'no database operation was started. Retry after a request completes, or ' +
+      'increase [Options] BusyTimeout or [Options] PoolSize.',
+      [FGate.SlotCount, FBusyTimeoutMs])
+  else
+    Result := Format(
+      'NexusDB is busy processing another request; no database operation was started ' +
+      'after waiting %d ms. Retry after it completes or increase [Options] BusyTimeout.',
+      [FBusyTimeoutMs]);
   if ABlockingOperation <> '' then
-    Result := Result + ' Active operation: ' + ABlockingOperation + '.';
+    Result := Result + ' Active operations: ' + ABlockingOperation + '.';
 end;
 
 function TnxSerializedManager.BuildToolBusyResult(
@@ -279,19 +448,23 @@ function TnxSerializedManager.ExecuteMethod(const Method: string;
   const Params: TJSONObject): TValue;
 var
   LBlockingOperation: string;
+  LExclusive: Boolean;
   LMessage: string;
   LOperation: string;
+  LSlot: Integer;
   LStopwatch: TStopwatch;
 begin
   if not SameText(Method, FInvokeMethod) then
     Exit(FInner.ExecuteMethod(Method, Params));
 
   LOperation := OperationDescription(Params);
+  LExclusive := WantsExclusive(Params);
   LStopwatch := TStopwatch.StartNew;
-  if not FGate.TryEnter(LOperation, FBusyTimeoutMs, LBlockingOperation) then
+  if not FGate.TryEnter(LOperation, LExclusive, FBusyTimeoutMs, LSlot,
+    LBlockingOperation) then
   begin
     LStopwatch.Stop;
-    LMessage := BusyMessage(LBlockingOperation);
+    LMessage := BusyMessage(LBlockingOperation, LExclusive);
     TLogger.Warning(Format('%s (actual wait %d ms)',
       [LMessage, LStopwatch.ElapsedMilliseconds]));
     if FKind = mkTools then
@@ -302,12 +475,13 @@ begin
 
   LStopwatch.Stop;
   if LStopwatch.ElapsedMilliseconds > 0 then
-    TLogger.Info(Format('Acquired NexusDB execution gate for %s after %d ms.',
-      [LOperation, LStopwatch.ElapsedMilliseconds]));
+    TLogger.Info(Format('Acquired NexusDB session %d%s for %s after %d ms.',
+      [LSlot, IfThen(LExclusive, ' (exclusive)', ''), LOperation,
+       LStopwatch.ElapsedMilliseconds]));
   try
     Result := FInner.ExecuteMethod(Method, Params);
   finally
-    FGate.Leave;
+    FGate.Leave(LSlot);
   end;
 end;
 

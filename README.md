@@ -5,7 +5,7 @@ An MCP (Model Context Protocol) server that enables AI assistants to interact wi
 ## Features
 
 * **Dual Transport** - HTTP and STDIO (for Claude Desktop and other MCP clients)
-* **Safe Shared Access** - Concurrent HTTP callers are serialized with a bounded wait, and timed-out NexusDB sessions are replaced before the next request
+* **Concurrent Access** - A pool of NexusDB sessions (`[Options] PoolSize`, default 4) serves concurrent HTTP callers in parallel, with a bounded wait when all are busy; timed-out sessions are replaced before their next request
 * **Query Execution** - Run SELECT queries and retrieve results as JSON
 * **Data Manipulation** - Insert, update, and delete records
 * **Schema Management** - Create tables, add columns, manage indexes
@@ -62,6 +62,8 @@ AutoConnect=1
 Timeout=3000
 ; Maximum time to wait for another database request to finish (0=fail fast)
 BusyTimeout=3000
+; Number of NexusDB sessions serving tool calls concurrently (1 = one call at a time)
+PoolSize=4
 ; Write log output to a file (1=yes, 0=no)
 LogToFile=0
 ; Log file path (leave empty for <exe name>.log next to the executable)
@@ -128,12 +130,28 @@ The server starts on `http://localhost:3000/mcp` by default.
 
 ### Concurrent HTTP clients
 
-One nxmcp process currently owns one NexusDB session. Database-backed `tools/call` and
-`resources/read` requests therefore execute one at a time; this prevents NexusDB's
-`DBIERR_REENTERED` failure when several MCP clients share the HTTP endpoint. Waiting is
-bounded by `[Options] BusyTimeout`. If the lease cannot be acquired in time, the request
-returns a normal MCP error result saying the database is busy and no database operation was
-started. `0` means fail fast; negative values are invalid and fall back to 3000 ms.
+One nxmcp process owns a pool of `[Options] PoolSize` NexusDB sessions (default 4, maximum
+32). Each database-backed `tools/call` or `resources/read` borrows one session for its
+duration, so up to `PoolSize` requests run in parallel — a quick query no longer waits behind
+a slow one. A session is never shared by two requests at once, which prevents NexusDB's
+`DBIERR_REENTERED` failure. Only the first session connects at startup; the others connect
+the first time they are needed. `PoolSize=1` restores strictly one-at-a-time execution. In
+remote mode each session opens its own connection to the NXserver.
+
+Some calls need the database to themselves and wait until every session is free:
+`switch_database`, `switch_server`, `set_timeout`, `close_inactive_tables`, schema changes
+and table maintenance on existing tables, and `execute_sql` / `batch_execute` when they
+contain anything other than plain `SELECT`/`INSERT`/`UPDATE`/`DELETE`. Before one runs, the
+other sessions release their cached tables (so the table is not reported "in use"); after it,
+they follow the new server/database and timeout. While such a call is waiting, new requests
+queue behind it.
+
+Waiting is bounded by `[Options] BusyTimeout`. If a session (or, for the calls above, all of
+them) cannot be acquired in time, the request returns a normal MCP error result saying the
+database is busy and no database operation was started. `0` means fail fast; negative values
+are invalid and fall back to 3000 ms.
+
+`get_query_log` returns the log of the most recent query that produced one, from any client.
 
 `[Options] Timeout` is separate: it limits the NexusDB operation itself. Changing it with
 `set_timeout` does not change `BusyTimeout`. A general NexusDB timeout is reported once and

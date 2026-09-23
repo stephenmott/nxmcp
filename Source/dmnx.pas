@@ -14,7 +14,7 @@ type
   /// <summary>
   /// How the session reaches a NexusDB server:
   ///  smRemote   - via nxRemoteServerEngine1 + transport (a separate NXserver process)
-  ///  smEmbedded - via nxServerEngine1, an in-process local server engine (AliasPath only)
+  ///  smEmbedded - via the pool's shared TnxServerEngine, an in-process local server engine (AliasPath only)
   /// </summary>
   TnxServerMode = (smRemote, smEmbedded);
 
@@ -27,11 +27,15 @@ type
     nxWinsockTransport1: TnxWinsockTransport;
     dsTable1: TDataSource;
     dsQuery1: TDataSource;
-    nxServerEngine1: TnxServerEngine;
-    nxSqlEngine1: TnxSqlEngine;
     procedure DataModuleCreate(Sender: TObject);
     procedure DataModuleDestroy(Sender: TObject);
   private
+    // The in-process engine used in embedded mode. Owned by TnxSessionPool and
+    // shared by every pooled context: two engines opening the same folder in one
+    // process would fight over its files. A context never deactivates it.
+    FEmbeddedEngine: TnxServerEngine;
+    FLastError: string;
+    FPoolSize: Integer;
     FServerMode: TnxServerMode;
     FDefaultServerMode: TnxServerMode;
     FServerHost: string;
@@ -84,7 +88,31 @@ type
     procedure RetireSessionAfterError(E: Exception);
     function ExecuteWithPolicy(const AAction: TProc;
       AAllowRetry: Boolean; const ABeforeRecovery: TNxFailureProc = nil): Boolean;
+    procedure CopyTargetFrom(ASource: Tnxmodule);
+    function SameTargetAs(ASource: Tnxmodule): Boolean;
   public
+    /// <summary>
+    /// First pooled context: loads the ini, configures logging and the serializer,
+    /// and connects if AutoConnect is set. AEmbeddedEngine is the pool's shared engine.
+    /// </summary>
+    procedure InitializePrimary(AEmbeddedEngine: TnxServerEngine);
+    /// <summary>
+    /// Further pooled contexts: copy the primary's settings and target. They stay
+    /// disconnected until a tool call's EnsureConnection/EnsureSession needs them.
+    /// </summary>
+    procedure InitializeFrom(APrimary: Tnxmodule; AEmbeddedEngine: TnxServerEngine);
+    /// <summary>
+    /// After an exclusive call on another context, adopt that context's target
+    /// (mode, server, database, passwords) and timeout. A changed target retires
+    /// this context's session; the next tool call reconnects it lazily.
+    /// </summary>
+    procedure SyncTargetFrom(ASource: Tnxmodule);
+    /// <summary>
+    /// Close this context's datasets and the tables/folders the server caches for
+    /// its session, so a DDL or maintenance call on another context does not find
+    /// the table still in use. Fail-soft: a dead session is retired instead.
+    /// </summary>
+    procedure ReleaseServerCache;
     function Connect: Boolean;
     procedure Disconnect;
     procedure ForceDisconnect;
@@ -132,9 +160,22 @@ type
     property DefaultServerPort: Integer read FDefaultServerPort;
     property TablePassword: string read FTablePassword;
     property BusyTimeout: Integer read FBusyTimeout;
+    /// <summary>[Options] PoolSize: number of NexusDB sessions (1..MaxPoolSize).</summary>
+    property PoolSize: Integer read FPoolSize;
   end;
 
-var
+const
+  DefaultPoolSize = 4;
+  MaxPoolSize = 32;
+
+threadvar
+  /// <summary>
+  /// The pooled context serving the tool call or resource read running on this
+  /// thread. TnxSessionPool binds it when the execution gate hands out a context
+  /// and restores it on release; it is nil on any thread outside a gated call.
+  /// A threadvar rather than a plain global so that concurrent calls each see
+  /// their own session while the tool units keep writing nxmodule.nxQuery1.
+  /// </summary>
   nxmodule: Tnxmodule;
 
 implementation
@@ -158,9 +199,6 @@ uses
 
 {$R *.dfm}
 
-var
-  GLastError: string;
-
 /// <summary>
 /// Append a restart hint when the in-process engine is in the unrecoverable
 /// fatal state. The library's own rsFatalError text says "until the server is
@@ -179,9 +217,16 @@ end;
 
 procedure Tnxmodule.DataModuleCreate(Sender: TObject);
 begin
-  GLastError := '';
+  // Configuration and connection happen in InitializePrimary/InitializeFrom, which
+  // TnxSessionPool calls once the shared embedded engine is known.
+  FLastError := '';
   FToolSwitches := TDictionary<string, Boolean>.Create;
   FResourceSwitches := TDictionary<string, Boolean>.Create;
+end;
+
+procedure Tnxmodule.InitializePrimary(AEmbeddedEngine: TnxServerEngine);
+begin
+  FEmbeddedEngine := AEmbeddedEngine;
   LoadConfig;
   ConfigureLogging;
   ConfigureSerializer;
@@ -189,6 +234,93 @@ begin
 
   if FAutoConnect then
     Connect;
+end;
+
+procedure Tnxmodule.InitializeFrom(APrimary: Tnxmodule;
+  AEmbeddedEngine: TnxServerEngine);
+begin
+  // Logging and the serializer are process-wide and were set up by the primary;
+  // the [Tools]/[Resources] switches are only ever consulted on the primary.
+  FEmbeddedEngine := AEmbeddedEngine;
+  FConfigPath := APrimary.FConfigPath;
+  FPoolSize := APrimary.FPoolSize;
+  FDefaultServerMode := APrimary.FDefaultServerMode;
+  FDefaultServerHost := APrimary.FDefaultServerHost;
+  FDefaultServerPort := APrimary.FDefaultServerPort;
+  FDefaultAliasName := APrimary.FDefaultAliasName;
+  FDefaultAliasPath := APrimary.FDefaultAliasPath;
+  FUsername := APrimary.FUsername;
+  FPassword := APrimary.FPassword;
+  FAutoConnect := APrimary.FAutoConnect;
+  FBusyTimeout := APrimary.FBusyTimeout;
+  FLogToFile := APrimary.FLogToFile;
+  FLogFileName := APrimary.FLogFileName;
+  CopyTargetFrom(APrimary);
+  FTimeout := APrimary.nxDatabase1.Timeout;
+  ConfigureComponents;
+end;
+
+procedure Tnxmodule.CopyTargetFrom(ASource: Tnxmodule);
+begin
+  FServerMode := ASource.FServerMode;
+  FServerHost := ASource.FServerHost;
+  FServerPort := ASource.FServerPort;
+  FAliasName := ASource.FAliasName;
+  FAliasPath := ASource.FAliasPath;
+  FTablePassword := ASource.FTablePassword;
+  FTablePasswordIsCommaList := ASource.FTablePasswordIsCommaList;
+  FExtraTablePasswords := Copy(ASource.FExtraTablePasswords);
+end;
+
+function Tnxmodule.SameTargetAs(ASource: Tnxmodule): Boolean;
+var
+  I: NativeInt;
+begin
+  Result := (FServerMode = ASource.FServerMode) and
+    SameText(FServerHost, ASource.FServerHost) and
+    (FServerPort = ASource.FServerPort) and
+    SameText(FAliasName, ASource.FAliasName) and
+    SameText(FAliasPath, ASource.FAliasPath) and
+    (FTablePassword = ASource.FTablePassword) and
+    (FTablePasswordIsCommaList = ASource.FTablePasswordIsCommaList) and
+    (Length(FExtraTablePasswords) = Length(ASource.FExtraTablePasswords));
+  if Result then
+    for I := 0 to High(FExtraTablePasswords) do
+      if FExtraTablePasswords[I] <> ASource.FExtraTablePasswords[I] then
+        Exit(False);
+end;
+
+procedure Tnxmodule.SyncTargetFrom(ASource: Tnxmodule);
+begin
+  if not SameTargetAs(ASource) then
+  begin
+    // The session belongs to the old server/database (and, across a mode change,
+    // to the other engine). Retire it; EnsureConnection reconnects on next use.
+    ForceDisconnect;
+    CopyTargetFrom(ASource);
+    ConfigureComponents;
+  end;
+
+  // set_timeout changes the acting context's database component only.
+  FTimeout := ASource.nxDatabase1.Timeout;
+  nxDatabase1.Timeout := FTimeout;
+end;
+
+procedure Tnxmodule.ReleaseServerCache;
+begin
+  if not nxSession1.Active then
+    Exit;
+  try
+    ReleaseDatasets;
+    nxSession1.CloseInactiveFolders;
+  except
+    on E: Exception do
+    begin
+      TLogger.Warning('Releasing a pooled session''s table cache failed (' +
+        E.Message + '); retiring that session.');
+      ForceDisconnect;
+    end;
+  end;
 end;
 
 procedure Tnxmodule.DataModuleDestroy(Sender: TObject);
@@ -218,6 +350,7 @@ begin
   FAutoConnect := True;
   FTimeout := 3000;
   FBusyTimeout := 3000;
+  FPoolSize := DefaultPoolSize;
   FLogToFile := False;
   FLogFileName := '';
 
@@ -277,6 +410,14 @@ begin
       TLogger.Warning(Format(
         'Invalid [Options] BusyTimeout=%d; using 3000 ms.', [FBusyTimeout]));
       FBusyTimeout := 3000;
+    end;
+    FPoolSize := LIniFile.ReadInteger('Options', 'PoolSize', FPoolSize);
+    if (FPoolSize < 1) or (FPoolSize > MaxPoolSize) then
+    begin
+      TLogger.Warning(Format(
+        'Invalid [Options] PoolSize=%d (allowed 1..%d); using %d.',
+        [FPoolSize, MaxPoolSize, DefaultPoolSize]));
+      FPoolSize := DefaultPoolSize;
     end;
     FLogToFile := LIniFile.ReadBool('Options', 'LogToFile', FLogToFile);
     FLogFileName := LIniFile.ReadString('Options', 'LogFileName', FLogFileName);
@@ -394,6 +535,8 @@ begin
     LIniFile.WriteInteger('Options', 'Timeout', 3000);
     LIniFile.WriteString('Options', '; Maximum time to wait for another NexusDB request to finish (0 = fail fast)', '');
     LIniFile.WriteInteger('Options', 'BusyTimeout', 3000);
+    LIniFile.WriteString('Options', '; Number of NexusDB sessions serving tool calls concurrently (1 = one call at a time)', '');
+    LIniFile.WriteInteger('Options', 'PoolSize', DefaultPoolSize);
     LIniFile.WriteString('Options', '; Write log output to a file (1=yes, 0=no)', '');
     LIniFile.WriteBool('Options', 'LogToFile', False);
     LIniFile.WriteString('Options', '; Log file path (leave empty for <exe name>.<pid>.log next to the executable)', '');
@@ -482,7 +625,7 @@ begin
   // requires the session to be inactive, so callers must close it first; assigning
   // only when it differs avoids the inactive check on a no-op.
   if FServerMode = smEmbedded then
-    LDesired := nxServerEngine1
+    LDesired := FEmbeddedEngine
   else
     LDesired := nxRemoteServerEngine1;
   if nxSession1.ServerEngine <> LDesired then
@@ -491,8 +634,8 @@ end;
 
 procedure Tnxmodule.ConfigureComponents;
 begin
-  // Note: the local engine's SQL support is wired declaratively in the DFM
-  // (nxServerEngine1.SqlEngine = nxSqlEngine1), matching the NexusDB embedded demos.
+  // Note: the shared embedded engine and its SQL engine are created and wired by
+  // TnxSessionPool (the equivalent of the DFM wiring in the NexusDB embedded demos).
 
   // Configure transport (used by remote mode only)
   nxWinsockTransport1.ServerName := FServerHost;
@@ -608,7 +751,7 @@ end;
 
 function Tnxmodule.Connect: Boolean;
 begin
-  GLastError := '';
+  FLastError := '';
 
   try
     // Ensure the session is attached to the engine for the current mode. This
@@ -623,7 +766,7 @@ begin
   except
     on E: Exception do
     begin
-      GLastError := WithFatalHint(E.Message);
+      FLastError := WithFatalHint(E.Message);
       Result := False;
     end;
   end;
@@ -631,11 +774,9 @@ end;
 
 function Tnxmodule.ConnectRemote: Boolean;
 begin
-  // Remote mode uses the transport + remote engine; the embedded engine stays off.
-  if nxServerEngine1.Active then
-    nxServerEngine1.Active := False;
-  if nxSqlEngine1.Active then
-    nxSqlEngine1.Active := False;
+  // Remote mode uses this context's own transport + remote engine. The shared
+  // embedded engine is not ours to stop; TnxSessionPool shuts it down once no
+  // context is in embedded mode any more.
 
   // Activate transport
   if not nxWinsockTransport1.Active then
@@ -679,7 +820,7 @@ begin
   if nxWinsockTransport1.Active then
     nxWinsockTransport1.Active := False;
 
-  // The SQL engine is wired to the local engine in the DFM (SqlEngine = nxSqlEngine1).
+  // The SQL engine is wired to the shared local engine by TnxSessionPool.
   // Open the session. The NexusDB state model makes the SQL engine the state-parent
   // of the server engine, which is the state-parent of the session, so opening the
   // session cascades activation up the chain in the correct order.
@@ -716,10 +857,11 @@ procedure Tnxmodule.TearDownComponents(out AFirstError: string);
 begin
   // Close in reverse order, each step guarded on its own. Closing a dataset, a
   // database or a session is a server round-trip that raises once the socket is
-  // dead, and a single failure must not leave the engines or the transport
+  // dead, and a single failure must not leave the engine or the transport
   // behind - so every step is attempted and every component ends up inactive.
-  // Both engines are torn down, so the components not in use for the current
-  // mode are always left inactive. The first error is reported to the caller.
+  // The shared embedded engine is deliberately left alone: other pooled contexts
+  // may have sessions open on it (TnxSessionPool owns its lifetime). The first
+  // error is reported to the caller.
   AFirstError := '';
 
   Step('nxQuery1',
@@ -732,10 +874,6 @@ begin
     procedure begin if nxSession1.Active then nxSession1.Close; end);
   Step('nxRemoteServerEngine1',
     procedure begin if nxRemoteServerEngine1.Active then nxRemoteServerEngine1.Active := False; end);
-  Step('nxServerEngine1',
-    procedure begin if nxServerEngine1.Active then nxServerEngine1.Active := False; end);
-  Step('nxSqlEngine1',
-    procedure begin if nxSqlEngine1.Active then nxSqlEngine1.Active := False; end);
   Step('nxWinsockTransport1',
     procedure begin if nxWinsockTransport1.Active then nxWinsockTransport1.Active := False; end);
 end;
@@ -747,7 +885,7 @@ begin
   // Graceful teardown: completes in full, and reports the first failure.
   TearDownComponents(LError);
   if LError <> '' then
-    GLastError := LError;
+    FLastError := LError;
 end;
 
 function Tnxmodule.IsConnected: Boolean;
@@ -808,7 +946,7 @@ begin
                    ' on ' + FServerHost + ':' + IntToStr(FServerPort));
   end
   else
-    TLogger.Warning('Reconnect to NexusDB failed: ' + GLastError);
+    TLogger.Warning('Reconnect to NexusDB failed: ' + FLastError);
 end;
 
 function Tnxmodule.EnsureConnection: Boolean;
@@ -820,7 +958,7 @@ end;
 
 function Tnxmodule.EnsureSession: Boolean;
 begin
-  GLastError := '';
+  FLastError := '';
 
   if nxSession1.Active then
     Exit(True);
@@ -848,8 +986,8 @@ begin
   except
     on E: Exception do
     begin
-      GLastError := WithFatalHint(E.Message);
-      TLogger.Warning('Failed to re-establish NexusDB session: ' + GLastError);
+      FLastError := WithFatalHint(E.Message);
+      TLogger.Warning('Failed to re-establish NexusDB session: ' + FLastError);
       Result := False;
     end;
   end;
@@ -983,7 +1121,7 @@ begin
   // already completed teardown, so do not run that sequence a second time.
   Result := Connect;
   if not Result then
-    TLogger.Warning('Failed to establish a clean NexusDB session: ' + GLastError);
+    TLogger.Warning('Failed to establish a clean NexusDB session: ' + FLastError);
 end;
 
 function Tnxmodule.ExecuteWithPolicy(const AAction: TProc;
@@ -1019,7 +1157,7 @@ end;
 
 function Tnxmodule.GetLastError: string;
 begin
-  Result := GLastError;
+  Result := FLastError;
 end;
 
 function Tnxmodule.GetAliasNames: TStringList;
@@ -1050,19 +1188,19 @@ var
   LTargetDesc: string;
   LFailure: string;
 begin
-  GLastError := '';
+  FLastError := '';
 
   // Exactly one of AAliasName / AAliasPath must be supplied (they are mutually
   // exclusive on TnxDatabase). Public callers already enforce this; guard anyway.
   if (Trim(AAliasName) = '') and (Trim(AAliasPath) = '') then
   begin
-    GLastError := 'Either an alias name or an alias path must be specified';
-    raise Exception.Create(GLastError);
+    FLastError := 'Either an alias name or an alias path must be specified';
+    raise Exception.Create(FLastError);
   end;
   if (Trim(AAliasName) <> '') and (Trim(AAliasPath) <> '') then
   begin
-    GLastError := 'Specify either an alias name or an alias path, not both';
-    raise Exception.Create(GLastError);
+    FLastError := 'Specify either an alias name or an alias path, not both';
+    raise Exception.Create(FLastError);
   end;
 
   // In embedded mode the alias path is a directory local to this process, so a
@@ -1072,8 +1210,8 @@ begin
   if (FServerMode = smEmbedded) and (AAliasPath <> '') and
      not DirectoryExists(AAliasPath) then
   begin
-    GLastError := 'Embedded database path does not exist: ' + AAliasPath;
-    raise Exception.Create(GLastError);
+    FLastError := 'Embedded database path does not exist: ' + AAliasPath;
+    raise Exception.Create(FLastError);
   end;
 
   if AAliasPath <> '' then
@@ -1113,13 +1251,13 @@ begin
 
     // Reopen on the new target (reapplies the table password)
     if not OpenTargetDatabase then
-      raise Exception.Create(GLastError);
+      raise Exception.Create(FLastError);
 
     Result := nxDatabase1.Connected;
   except
     on E: Exception do
     begin
-      // Held in a local: the rollback below runs Connect, which overwrites GLastError.
+      // Held in a local: the rollback below runs Connect, which overwrites FLastError.
       LFailure := 'Failed to switch to ' + LTargetDesc + ': ' + E.Message;
 
       // A timeout/re-entry/communication loss invalidates the session. Retire it
@@ -1141,14 +1279,14 @@ begin
         // OpenTargetDatabase reapplies the restored password using the restored
         // comma-list flag, so a rolled-back legacy TablePassword is split again.
         if not OpenTargetDatabase then
-          raise Exception.Create(GLastError);
+          raise Exception.Create(FLastError);
       except
         on E2: Exception do
           LFailure := LFailure + ' Rollback also failed: ' + E2.Message;
       end;
 
-      GLastError := WithFatalHint(LFailure);
-      raise Exception.Create(GLastError);
+      FLastError := WithFatalHint(LFailure);
+      raise Exception.Create(FLastError);
     end;
   end;
 end;
@@ -1158,13 +1296,13 @@ function Tnxmodule.SwitchDatabase(const AAliasName: string;
 begin
   if FServerMode = smEmbedded then
   begin
-    GLastError := 'Alias names are not available in embedded mode; use an alias path instead';
-    raise Exception.Create(GLastError);
+    FLastError := 'Alias names are not available in embedded mode; use an alias path instead';
+    raise Exception.Create(FLastError);
   end;
   if Trim(AAliasName) = '' then
   begin
-    GLastError := 'Alias name cannot be empty';
-    raise Exception.Create(GLastError);
+    FLastError := 'Alias name cannot be empty';
+    raise Exception.Create(FLastError);
   end;
   Result := SwitchDatabaseTarget(AAliasName, '', ATablePassword);
 end;
@@ -1174,8 +1312,8 @@ function Tnxmodule.SwitchDatabaseByPath(const AAliasPath: string;
 begin
   if Trim(AAliasPath) = '' then
   begin
-    GLastError := 'Alias path cannot be empty';
-    raise Exception.Create(GLastError);
+    FLastError := 'Alias path cannot be empty';
+    raise Exception.Create(FLastError);
   end;
   Result := SwitchDatabaseTarget('', AAliasPath, ATablePassword);
 end;
@@ -1194,12 +1332,12 @@ var
   LOldExtraPasswords: TArray<string>;
   LFailure: string;
 begin
-  GLastError := '';
+  FLastError := '';
 
   if Trim(AServerHost) = '' then
   begin
-    GLastError := 'Server host cannot be empty';
-    raise Exception.Create(GLastError);
+    FLastError := 'Server host cannot be empty';
+    raise Exception.Create(FLastError);
   end;
 
   // Use current port if not specified
@@ -1208,8 +1346,8 @@ begin
 
   if (Trim(AAliasName) <> '') and (Trim(AAliasPath) <> '') then
   begin
-    GLastError := 'Specify either an alias name or an alias path, not both';
-    raise Exception.Create(GLastError);
+    FLastError := 'Specify either an alias name or an alias path, not both';
+    raise Exception.Create(FLastError);
   end;
 
   // Save current state for rollback
@@ -1262,13 +1400,13 @@ begin
 
     // Full reconnect (transport -> engine -> session -> database + password)
     if not Connect then
-      raise Exception.Create(GLastError);
+      raise Exception.Create(FLastError);
 
     Result := nxDatabase1.Connected;
   except
     on E: Exception do
     begin
-      // Held in a local: the rollback below runs Connect, which overwrites GLastError.
+      // Held in a local: the rollback below runs Connect, which overwrites FLastError.
       LFailure := 'Failed to switch to server "' + AServerHost + ':' +
                   IntToStr(AServerPort) + '": ' + E.Message;
 
@@ -1293,14 +1431,14 @@ begin
 
         // Connect reports failure by returning False, not by raising.
         if not Reconnect then
-          LFailure := LFailure + ' Rollback also failed: ' + GLastError;
+          LFailure := LFailure + ' Rollback also failed: ' + FLastError;
       except
         on E2: Exception do
           LFailure := LFailure + ' Rollback also failed: ' + E2.Message;
       end;
 
-      GLastError := WithFatalHint(LFailure);
-      raise Exception.Create(GLastError);
+      FLastError := WithFatalHint(LFailure);
+      raise Exception.Create(FLastError);
     end;
   end;
 end;
@@ -1318,12 +1456,12 @@ var
   LOldExtraPasswords: TArray<string>;
   LFailure: string;
 begin
-  GLastError := '';
+  FLastError := '';
 
   if Trim(AAliasPath) = '' then
   begin
-    GLastError := 'Embedded mode requires an alias path';
-    raise Exception.Create(GLastError);
+    FLastError := 'Embedded mode requires an alias path';
+    raise Exception.Create(FLastError);
   end;
 
   // The embedded engine opens a directory in this process: a bad target can be
@@ -1331,8 +1469,8 @@ begin
   // connection untouched (no rollback needed).
   if not DirectoryExists(AAliasPath) then
   begin
-    GLastError := 'Embedded database path does not exist: ' + AAliasPath;
-    raise Exception.Create(GLastError);
+    FLastError := 'Embedded database path does not exist: ' + AAliasPath;
+    raise Exception.Create(FLastError);
   end;
 
   // Already embedded: only the database target changes, so switch at the
@@ -1375,13 +1513,13 @@ begin
 
     // Reconnect via the embedded engine
     if not Connect then
-      raise Exception.Create(GLastError);
+      raise Exception.Create(FLastError);
 
     Result := nxDatabase1.Connected;
   except
     on E: Exception do
     begin
-      // Held in a local: the rollback below runs Connect, which overwrites GLastError.
+      // Held in a local: the rollback below runs Connect, which overwrites FLastError.
       LFailure := 'Failed to switch to embedded database "' + AAliasPath +
                   '": ' + E.Message;
 
@@ -1406,14 +1544,14 @@ begin
 
         // Connect reports failure by returning False, not by raising.
         if not Reconnect then
-          LFailure := LFailure + ' Rollback also failed: ' + GLastError;
+          LFailure := LFailure + ' Rollback also failed: ' + FLastError;
       except
         on E2: Exception do
           LFailure := LFailure + ' Rollback also failed: ' + E2.Message;
       end;
 
-      GLastError := WithFatalHint(LFailure);
-      raise Exception.Create(GLastError);
+      FLastError := WithFatalHint(LFailure);
+      raise Exception.Create(FLastError);
     end;
   end;
 end;

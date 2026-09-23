@@ -2,6 +2,34 @@
 
 Notable changes to nxmcp.
 
+## [Unreleased]
+
+### Added
+
+* NexusDB session pool (`nxmcp.SessionPool.pas`). `[Options] PoolSize` (default 4, 1..32)
+  contexts, each with its own session, database, datasets and — in remote mode — its own
+  transport, serve `tools/call` and `resources/read` in parallel. Previously every request
+  queued behind a single session, so one slow query made every other client wait and then fail
+  as busy. Extra sessions connect lazily; `PoolSize=1` keeps the old behaviour.
+* Exclusive calls (`nxmcp.ExclusiveTools.pas`): target switches, `set_timeout`,
+  `close_inactive_tables`, schema/metadata/maintenance tools on existing tables, and
+  `execute_sql` / `batch_execute` carrying anything but plain DML wait for every session. The
+  other sessions release their server-side table cache first and adopt the resulting target and
+  timeout afterwards. A waiting exclusive call is not starved by new shared calls.
+* Concurrency tests for multi-slot admission, LIFO slot reuse, exclusive waiting and
+  writer preference, abandoned exclusive waiters, and exclusive-tool classification.
+
+### Changed
+
+* `nxmodule` is now a `threadvar` bound to the serving context for the duration of each gated
+  call (nil elsewhere); tool units are unchanged. The last-error text is per context.
+* The embedded `TnxServerEngine`/`TnxSqlEngine` moved out of `dmnx.dfm` into the pool and are
+  shared by all contexts; a context's teardown or recovery no longer stops the embedded engine.
+* `get_query_log` returns the most recent *logged* query from any session instead of reading
+  whichever session served the call.
+* `INxExecutionGate` takes an exclusivity flag and returns the slot it granted;
+  `CreateExecutionGate` takes a slot count and enter/leave hooks.
+
 ## [6.0.0.0] - 2026-08-30
 
 Major version because concurrency and failure recovery now have an explicit execution and

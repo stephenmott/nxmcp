@@ -116,7 +116,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Graceful degradation works by *asking the server*, not by trusting the constants compiled into nxmcp: when the `SELECT * FROM #<table>` fails, `ServerKnowsMetaTable` reads `SELECT METATABLE_NAME FROM #META`, which enumerates `ReservedTableNames` **as implemented by the SQL engine that ran the query**. In remote mode that engine lives in `nxServer.exe`, whose version is independent of this client — a client-side check would be wrong there. Only a name genuinely missing from `#META` yields `"available": false` plus an explanation; anything else (permissions, dead socket, …) is re-raised. If the `#META` probe itself fails, it returns `True` so the *original* error surfaces rather than a bogus "your server is too old". `list_locks` needs the SQL engine and therefore `EnsureConnection`. Row keys are lower-camel-cased by `dataset.serialize` (`TABLE_NAME` → `tableName`).
 
-`close_inactive_tables` calls `nxSession1.CloseInactiveTables` **then** `CloseInactiveFolders` (that order — a folder cannot be released while one of its tables is still open; the EnterpriseManager does the same two calls in the same order). It closes `nxQuery1`/`nxTable1` first, since our own active cursors would otherwise survive the sweep. It uses **`EnsureSession`, not `EnsureConnection`**: the cache belongs to the session, and freeing server-side file handles is most useful exactly when the current database will not open — requiring a healthy database would block the cleanup that fixes it.
+`close_inactive_tables` calls `nxSession1.CloseInactiveTables` **then** `CloseInactiveFolders` (that order — a folder cannot be released while one of its tables is still open; the EnterpriseManager does the same two calls in the same order). It closes `nxQuery1`/`nxTable1` first, since our own active cursors would otherwise survive the sweep. It uses **`EnsureSession`, not `EnsureConnection`**: the cache belongs to the session, and freeing server-side file handles is most useful exactly when the current database will not open — requiring a healthy database would block the cleanup that fixes it. It is an exclusive call, so the pool first runs the same release on every other pooled session (`TnxSessionPool.PrepareExclusive`) — the sweep covers all of nxmcp's sessions, not just the one serving the call.
 
 ### Logging
 `[Options] LogToFile` (default off) enables file logging; `[Options] LogFileName` overrides the path. **Leave `LogFileName` empty**: `Tnxmodule.ConfigureLogging` then derives `<exe name>.<pid>.log`, one file per process.
@@ -145,21 +145,57 @@ File logging is implemented in `nxmcp.FileLog.pas`, **not** by `TLogger.LogToFil
 
 ### Concurrency and Connection Recovery
 
-One process currently owns one mutable NexusDB session. HTTP dispatch is concurrent, so the
-tool and resource managers are wrapped at startup as:
+One process owns a **pool** of `[Options] PoolSize` (default 4, 1..32) `Tnxmodule` contexts,
+built by `TnxSessionPool` (`nxmcp.SessionPool.pas`). Each context has its own session,
+database, `nxQuery1`/`nxTable1` and — in remote mode — its own transport and remote engine,
+so recovery on one context never touches another. The embedded `TnxServerEngine` +
+`TnxSqlEngine` are **owned by the pool and shared** (two engines opening one folder in one
+process would fight over its files); a context never deactivates it, and the pool stops it
+once no context is in embedded mode. Only the primary (slot 0) connects at startup; the others
+connect lazily via `EnsureConnection`/`EnsureSession` on first use. `PoolSize=1` reproduces
+the old one-call-at-a-time behaviour.
+
+HTTP dispatch is concurrent, so the tool and resource managers are wrapped at startup as:
 
 ```text
-FilterTools(SerializeTools(TMCPToolsManager.Create, SharedGate), IsToolEnabled)
-FilterResources(SerializeResources(TMCPResourcesManager.Create, SharedGate), IsResourceEnabled)
+FilterTools(SerializeTools(TMCPToolsManager.Create, Pool.Gate, BusyTimeout, IsExclusiveTool), IsToolEnabled)
+FilterResources(SerializeResources(TMCPResourcesManager.Create, Pool.Gate, BusyTimeout), IsResourceEnabled)
 ```
 
 The filter must remain outermost, and both serialized managers must receive the same gate.
-Only `tools/call` and `resources/read` acquire it. `tools/list`, `resources/list`,
-`resources/templates/list`, core methods such as `initialize`, and `ping` bypass it.
-`[Options] BusyTimeout` bounds acquisition independently of the database `Timeout`; `0`
-fails fast and negative configured values fall back to 3000 ms. Never log request arguments,
-SQL, passwords, or result data while diagnosing contention—only the tool name/resource URI
-and wait duration.
+The gate (`nxmcp.SerializedManager.pas`) has one slot per context. A **shared** call takes one
+free slot (LIFO, so sequential traffic keeps reusing one connected session); an **exclusive**
+call waits until every slot is free and holds them all, and while it waits no new shared call
+is admitted (no writer starvation). Only `tools/call` and `resources/read` acquire it.
+`tools/list`, `resources/list`, `resources/templates/list`, core methods such as `initialize`,
+and `ping` bypass it. `[Options] BusyTimeout` bounds acquisition independently of the database
+`Timeout`; `0` fails fast and negative configured values fall back to 3000 ms. Never log
+request arguments, SQL, passwords, or result data while diagnosing contention—only the tool
+name/resource URI, slot and wait duration.
+
+**`nxmodule` is a `threadvar`**, bound by the gate's enter hook to the context serving the
+call and restored on release. Tool units keep writing `nxmodule.nxQuery1` unchanged, but
+`nxmodule` is **nil on any thread outside a gated call** — code that runs outside one (startup,
+the `[Tools]`/`[Resources]` filter callbacks in `nxmcp.dpr`) must use `NexusPool.Primary`, and
+only for configuration, never its session. `GLastError` is gone; each context has its own
+`FLastError`.
+
+`IsExclusiveTool` (`nxmcp.ExclusiveTools.pas`) decides exclusivity: `switch_*`,
+`set_timeout`, `close_inactive_tables`, every tool that alters or needs sole access to an
+existing table (schema, metadata, maintenance, `change_password`), and `execute_sql` /
+`batch_execute` whenever the SQL is not plain single-statement DML (`SELECT … INTO` counts as
+DDL). An exclusive call runs `ReleaseServerCache` on every other context first (their
+server-side inactive-table cache would otherwise make the target table "in use"), and
+afterwards `SyncTargetFrom` copies the acting context's target (mode, host, port, alias,
+passwords) and database `Timeout` to the others — a changed target retires their session, and
+they reconnect lazily. So switch and `set_timeout` logic stays single-context; the pool
+propagates the result. When adding a tool that changes pool-wide state or restructures an
+existing table, add it to `ExclusiveTools`.
+
+`get_query_log` reads `NexusPool.LastQueryLog`, not `nxQuery1.Log` — the call may land on a
+different context than the logged query. The pool clears each context's log on enter and
+publishes it on leave only if the call produced one, so it returns the most recent *logged*
+query from any client.
 
 Every server round-trip must declare a retry policy. Use `ExecuteWithReconnect` only where
 replaying the action is part of the existing contract. Use `ExecuteWithoutRetry` for DDL,
@@ -194,7 +230,7 @@ mask the original operation exception.
 
 Rules:
 - **Never call `EnsureConnection`/`EnsureSession` in `switch_server` or `SwitchToEmbedded`.** The server being switched away from is frequently the one that is down — that is *why* the caller is switching. Requiring the old connection to be healthy turns the escape hatch into a deadlock.
-- **A teardown must never abort on its first failing step.** `Disconnect` and `ForceDisconnect` both run `TearDownComponents`, which wraps every `Close` / `Active := False` in its own `try..except`, so all eight components end up inactive even when the socket is dead. The two differ *only* in whether the first error is recorded in `GLastError` or discarded. Closing a dataset, database or session is a server round-trip and raises on a dead connection; a single-`try` sequence would skip the engines and leave the transport active (which then silently reuses a dead transport on the next `Connect`).
+- **A teardown must never abort on its first failing step.** `Disconnect` and `ForceDisconnect` both run `TearDownComponents`, which wraps every `Close` / `Active := False` in its own `try..except`, so all six per-context components end up inactive even when the socket is dead (the shared embedded engine is the pool's, and is never touched here). The two differ *only* in whether the first error is recorded in the context's `FLastError` or discarded. Closing a dataset, database or session is a server round-trip and raises on a dead connection; a single-`try` sequence would skip the engines and leave the transport active (which then silently reuses a dead transport on the next `Connect`).
 - **Mode-changing** switches tear down via `DisconnectForSwitch`, which guards `ReleaseDatasets` (its `nxSession1.CloseInactiveTables` is a server round-trip) and then calls `Disconnect`. An **embedded→embedded** `SwitchToEmbedded` never tears the engine down — it delegates to `SwitchDatabaseTarget` (database-level close/reopen; session, server engine and SQL engine stay up). `SwitchDatabaseTarget` uses `CloseDatabaseForSwitch`, which falls back to `ForceDisconnect` so that `OpenTargetDatabase` rebuilds the whole chain.
 - `OpenTargetDatabase` reopens on the new target, falling back to a full `Connect` when the preceding teardown had to force-disconnect.
 - In the `except` block of any switch, hold the failure message in a **local** before rolling back: `Connect` resets `GLastError` to `''` on entry, so a successful rollback silently erased the original error (this surfaced as `Error executing tool:` with an empty message).
@@ -204,9 +240,9 @@ Rules:
 ### Server Mode: Remote vs Embedded
 The `[Connection] Mode` ini key (or `switch_server`'s `mode` param) selects how `nxSession1` reaches a server:
 - **Remote** (default) — `nxSession1.ServerEngine = nxRemoteServerEngine1` over `nxWinsockTransport1` (a separate NXserver process). Supports `AliasName` or `AliasPath`.
-- **Embedded** — `nxSession1.ServerEngine = nxServerEngine1`, an in-process `TnxServerEngine` with `nxSqlEngine1` (`TnxSqlEngine`, wired in `dmnx.dfm` via `SqlEngine = nxSqlEngine1`) and the storage sub-engines from `uses nxseAllEngines`. **Embedded has no aliases — `AliasPath` only, and it is required.**
+- **Embedded** — `nxSession1.ServerEngine` = the pool's shared in-process `TnxServerEngine` (`Tnxmodule.FEmbeddedEngine`), with a `TnxSqlEngine` wired to it in `TnxSessionPool.Create` and the storage sub-engines from `uses nxseAllEngines`. **Embedded has no aliases — `AliasPath` only, and it is required.**
 
-`Connect` branches to `ConnectRemote`/`ConnectEmbedded`; `Disconnect`/`ForceDisconnect` deactivate *both* engines so the components not in use are always `Active := False`. `WireServerEngine` (re)points the session at the mode's engine (session must be closed). Runtime switch: `switch_server mode="embedded" aliasPath=...` → `dmnx.SwitchToEmbedded`; `mode="remote" ...` → `dmnx.SwitchServer` (a mode change does a full reconnect with rollback and sets `FServerMode`; embedded→embedded only switches the database, see the rules above). `switch_database` by `aliasName` is rejected while embedded (path only). `IsEmbedded`/`ServerMode` expose the state; `Tnxmodule.ModeToStr`/`StrToMode` parse `Remote`/`Embedded`.
+`Connect` branches to `ConnectRemote`/`ConnectEmbedded`; `Disconnect`/`ForceDisconnect` tear down the context's own chain (including its remote engine and transport) but never the shared embedded engine; `ConnectEmbedded` stops the context's remote transport, and the pool stops the embedded engine after an exclusive call leaves every context in remote mode. `WireServerEngine` (re)points the session at the mode's engine (session must be closed). Runtime switch: `switch_server mode="embedded" aliasPath=...` → `dmnx.SwitchToEmbedded`; `mode="remote" ...` → `dmnx.SwitchServer` (a mode change does a full reconnect with rollback and sets `FServerMode`; embedded→embedded only switches the database, see the rules above). `switch_database` by `aliasName` is rejected while embedded (path only). `IsEmbedded`/`ServerMode` expose the state; `Tnxmodule.ModeToStr`/`StrToMode` parse `Remote`/`Embedded`.
 
 > **Win64 build note (embedded SQL):** an older NexusDB revision truncated a pointer through a 32-bit `DWord` in the SQL tokenizer, so every embedded query on Win64 failed with `Invalid token: error at line 1 pos 1` (remote is unaffected — it tokenizes in the 32-bit `nxServer.exe`). Reported by a contributor building embedded support in July 2026. **Fixed in 4.75**, which uses the pointer-sized `TnxMemSize` at `nxSQLTok.pas:1213`; no patch needed there or later.
 

@@ -31,6 +31,8 @@ uses
   nxmcp.FileLog in 'nxmcp.FileLog.pas',
   nxmcp.CapabilityFilter in 'nxmcp.CapabilityFilter.pas',
   nxmcp.SerializedManager in 'nxmcp.SerializedManager.pas',
+  nxmcp.SessionPool in 'nxmcp.SessionPool.pas',
+  nxmcp.ExclusiveTools in 'nxmcp.ExclusiveTools.pas',
   nxmcp.FieldTypes in 'nxmcp.FieldTypes.pas',
   nxmcp.ColumnSpec in 'nxmcp.ColumnSpec.pas',
   nxmcp.SqlUtils in 'nxmcp.SqlUtils.pas',
@@ -171,55 +173,64 @@ end;
 
 procedure InitializeNexusDB;
 var
+  LPrimary: Tnxmodule;
   LTarget: string;
 begin
   TLogger.Info('Initializing NexusDB connection...');
-  nxmodule := Tnxmodule.Create(nil);
+  // Only the primary context connects at startup; the others connect on first use.
+  NexusPool := TnxSessionPool.Create;
+  LPrimary := NexusPool.Primary;
 
-  if nxmodule.IsConnected then
+  if LPrimary.IsConnected then
   begin
-    if nxmodule.AliasPath <> '' then
-      LTarget := 'path ' + nxmodule.AliasPath
+    if LPrimary.AliasPath <> '' then
+      LTarget := 'path ' + LPrimary.AliasPath
     else
-      LTarget := nxmodule.AliasName;
-    if nxmodule.IsEmbedded then
+      LTarget := LPrimary.AliasName;
+    if LPrimary.IsEmbedded then
       TLogger.Info('Connected to NexusDB (embedded): ' + LTarget)
     else
       TLogger.Info('Connected to NexusDB: ' + LTarget +
-                   ' @ ' + nxmodule.ServerHost + ':' + IntToStr(nxmodule.ServerPort));
+                   ' @ ' + LPrimary.ServerHost + ':' + IntToStr(LPrimary.ServerPort));
   end
   else
   begin
     TLogger.Warning('Not connected to NexusDB');
-    if nxmodule.GetLastError <> '' then
-      TLogger.Warning('  Error: ' + nxmodule.GetLastError);
+    if LPrimary.GetLastError <> '' then
+      TLogger.Warning('  Error: ' + LPrimary.GetLastError);
   end;
 end;
 
 procedure CreateManagerRegistry;
 var
+  LPrimary: Tnxmodule;
   LExecutionGate: INxExecutionGate;
 begin
-  Settings := TMCPSettings.Create(nxmodule.GetConfigPath);
+  // nxmodule is a threadvar bound only inside gated calls, so everything here -
+  // including the filter callbacks, which run on HTTP worker threads - reads the
+  // (immutable after startup) configuration from the primary context directly.
+  LPrimary := NexusPool.Primary;
+  Settings := TMCPSettings.Create(LPrimary.GetConfigPath);
   ManagerRegistry := TMCPManagerRegistry.Create;
   CoreManager := TMCPCoreManager.Create(Settings);
   ManagerRegistry.RegisterManager(CoreManager);
-  LExecutionGate := CreateExecutionGate;
+  // One slot per pooled session; binds nxmodule for the duration of each call.
+  LExecutionGate := NexusPool.Gate;
   // Wrapped so that anything switched off in [Tools] / [Resources] is neither
   // listed nor callable. Everything is on unless the ini says otherwise.
   ManagerRegistry.RegisterManager(
     FilterTools(SerializeTools(TMCPToolsManager.Create, LExecutionGate,
-      Cardinal(nxmodule.BusyTimeout)),
+      Cardinal(LPrimary.BusyTimeout), IsExclusiveTool),
       function(const AName: string): Boolean
       begin
-        Result := nxmodule.IsToolEnabled(AName);
+        Result := LPrimary.IsToolEnabled(AName);
       end));
   ManagerRegistry.RegisterManager(
     FilterResources(SerializeResources(TMCPResourcesManager.Create, LExecutionGate,
-      Cardinal(nxmodule.BusyTimeout)),
+      Cardinal(LPrimary.BusyTimeout)),
       function(const AURI: string): Boolean
       begin
-        Result := nxmodule.IsResourceEnabled(AURI);
+        Result := LPrimary.IsResourceEnabled(AURI);
       end));
 end;
 
@@ -302,7 +313,7 @@ begin
           Settings.Free;
         end;
       finally
-        nxmodule.Free;
+        FreeAndNil(NexusPool);
       end;
     except
       on E: Exception do

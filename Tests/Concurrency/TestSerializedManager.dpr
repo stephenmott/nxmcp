@@ -8,13 +8,16 @@ uses
   System.SyncObjs,
   System.JSON,
   System.Rtti,
+  System.Generics.Collections,
   nxdbBase,
   nxllBde,
   nxllException,
   MCPServer.Types,
   nxmcp.CapabilityFilter in '..\..\Source\nxmcp.CapabilityFilter.pas',
   nxmcp.NexusErrors in '..\..\Source\nxmcp.NexusErrors.pas',
-  nxmcp.SerializedManager in '..\..\Source\nxmcp.SerializedManager.pas';
+  nxmcp.SerializedManager in '..\..\Source\nxmcp.SerializedManager.pas',
+  nxmcp.SqlUtils in '..\..\Source\nxmcp.SqlUtils.pas',
+  nxmcp.ExclusiveTools in '..\..\Source\nxmcp.ExclusiveTools.pas';
 
 type
   TFakeManager = class(TInterfacedObject, IMCPCapabilityManager)
@@ -500,12 +503,247 @@ begin
   Check(LFakeObject.InvokeCount = 2, 'gate remained locked after exception');
 end;
 
+function StartToolCall(const AManager: IMCPCapabilityManager;
+  const AName: string): TThread;
+begin
+  Result := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LParams: TJSONObject;
+      LResult: TValue;
+    begin
+      LParams := ToolParams(AName);
+      try
+        LResult := AManager.ExecuteMethod('tools/call', LParams);
+        if not LResult.IsEmpty and LResult.IsType<TJSONObject> then
+          LResult.AsType<TJSONObject>.Free;
+      finally
+        LParams.Free;
+      end;
+    end);
+  Result.FreeOnTerminate := False;
+  Result.Start;
+end;
+
+function CallIsBusy(const AManager: IMCPCapabilityManager;
+  const AName: string): Boolean;
+var
+  LParams: TJSONObject;
+  LResult: TValue;
+begin
+  Result := False;
+  LParams := ToolParams(AName);
+  try
+    LResult := AManager.ExecuteMethod('tools/call', LParams);
+    if not LResult.IsEmpty and LResult.IsType<TJSONObject> then
+    begin
+      Result := LResult.AsType<TJSONObject>.GetValue('isError') <> nil;
+      LResult.AsType<TJSONObject>.Free;
+    end;
+  finally
+    LParams.Free;
+  end;
+end;
+
+function IsExclusiveName(const AName: string; const AArguments: TJSONObject): Boolean;
+begin
+  Result := SameText(AName, 'exclusive');
+end;
+
+procedure TestPooledSlotsRunConcurrently;
+var
+  LFakeObject: TFakeManager;
+  LFake: IMCPCapabilityManager;
+  LGate: INxExecutionGate;
+  LManager: IMCPCapabilityManager;
+  LThread1: TThread;
+  LThread2: TThread;
+  LSlots: TThreadList<Integer>;
+begin
+  LSlots := TThreadList<Integer>.Create;
+  LSlots.Duplicates := dupAccept;
+  try
+    LGate := CreateExecutionGate(2,
+      procedure(ASlot: Integer; AExclusive: Boolean)
+      begin
+        LSlots.Add(ASlot);
+      end);
+    LFakeObject := TFakeManager.Create('tools/call');
+    LFake := LFakeObject;
+    LManager := SerializeTools(LFake, LGate, 50, IsExclusiveName);
+    LFakeObject.BlockInvocations;
+
+    LThread1 := StartToolCall(LManager, 'first');
+    LThread2 := StartToolCall(LManager, 'second');
+    TThread.Sleep(200);
+    Check(LFakeObject.InvokeCount = 2, 'two slots did not admit two calls');
+    Check(CallIsBusy(LManager, 'third'), 'third call was not refused as busy');
+    Check(LFakeObject.InvokeCount = 2, 'busy third call reached the inner manager');
+
+    LFakeObject.ReleaseInvocations;
+    LThread1.WaitFor;
+    LThread2.WaitFor;
+    LThread1.Free;
+    LThread2.Free;
+    Check(LFakeObject.MaxActiveCount = 2, 'calls did not overlap');
+
+    with LSlots.LockList do
+    try
+      Check((Count = 2) and (Items[0] <> Items[1]),
+        'concurrent calls were not given distinct slots');
+      Clear;
+    finally
+      LSlots.UnlockList;
+    end;
+
+    // Sequential traffic keeps reusing the most recently released slot.
+    Check(not CallIsBusy(LManager, 'seq1'), 'sequential call 1 failed');
+    Check(not CallIsBusy(LManager, 'seq2'), 'sequential call 2 failed');
+    with LSlots.LockList do
+    try
+      Check((Count = 2) and (Items[0] = Items[1]),
+        'sequential calls did not reuse the same slot');
+    finally
+      LSlots.UnlockList;
+    end;
+  finally
+    LSlots.Free;
+  end;
+end;
+
+procedure TestExclusiveWaitsAndBlocksNewShared;
+var
+  LFakeObject: TFakeManager;
+  LFake: IMCPCapabilityManager;
+  LGate: INxExecutionGate;
+  LShort: IMCPCapabilityManager;
+  LLong: IMCPCapabilityManager;
+  LHolder: TThread;
+  LExclusive: TThread;
+  LExclusiveEntered: TEvent;
+  LSawExclusive: Boolean;
+begin
+  LExclusiveEntered := TEvent.Create(nil, True, False, '');
+  try
+    LSawExclusive := False;
+    LGate := CreateExecutionGate(2,
+      procedure(ASlot: Integer; AExclusive: Boolean)
+      begin
+        if AExclusive then
+        begin
+          LSawExclusive := True;
+          LExclusiveEntered.SetEvent;
+        end;
+      end);
+    LFakeObject := TFakeManager.Create('tools/call');
+    LFake := LFakeObject;
+    LShort := SerializeTools(LFake, LGate, 50, IsExclusiveName);
+    LLong := SerializeTools(LFake, LGate, 5000, IsExclusiveName);
+    LFakeObject.BlockInvocations;
+
+    LHolder := StartToolCall(LLong, 'holder');
+    Check(LFakeObject.Entered.WaitFor(1000) = wrSignaled, 'holder did not enter');
+
+    LExclusive := StartToolCall(LLong, 'exclusive');
+    TThread.Sleep(150);
+    Check(LExclusiveEntered.WaitFor(0) = wrTimeout,
+      'exclusive call entered while another slot was busy');
+
+    // A slot is free, but the waiting exclusive call must not be overtaken.
+    Check(CallIsBusy(LShort, 'latecomer'),
+      'shared call overtook a waiting exclusive call');
+
+    LFakeObject.ReleaseInvocations;
+    LHolder.WaitFor;
+    LExclusive.WaitFor;
+    LHolder.Free;
+    LExclusive.Free;
+    Check(LSawExclusive, 'exclusive call never ran');
+    Check(LFakeObject.InvokeCount = 2, 'unexpected number of invocations');
+  finally
+    LExclusiveEntered.Free;
+  end;
+end;
+
+procedure TestExclusiveTimeoutUnblocksShared;
+var
+  LFakeObject: TFakeManager;
+  LFake: IMCPCapabilityManager;
+  LGate: INxExecutionGate;
+  LManager: IMCPCapabilityManager;
+  LHolder: TThread;
+begin
+  LGate := CreateExecutionGate(2);
+  LFakeObject := TFakeManager.Create('tools/call');
+  LFake := LFakeObject;
+  LManager := SerializeTools(LFake, LGate, 100, IsExclusiveName);
+  LFakeObject.BlockInvocations;
+
+  LHolder := StartToolCall(LManager, 'holder');
+  Check(LFakeObject.Entered.WaitFor(1000) = wrSignaled, 'holder did not enter');
+  Check(CallIsBusy(LManager, 'exclusive'),
+    'exclusive call did not time out behind a busy slot');
+
+  // The abandoned exclusive waiter must no longer hold shared calls back.
+  LFakeObject.ReleaseInvocations;
+  Check(not CallIsBusy(LManager, 'after'),
+    'shared call stayed blocked after the exclusive waiter gave up');
+  LHolder.WaitFor;
+  LHolder.Free;
+end;
+
+function Args(const AKey, AValue: string): TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  Result.AddPair(AKey, AValue);
+end;
+
+procedure CheckExclusive(const AName, AKey, AValue: string; AExpected: Boolean);
+var
+  LArgs: TJSONObject;
+begin
+  if AKey = '' then
+    LArgs := nil
+  else
+    LArgs := Args(AKey, AValue);
+  try
+    Check(IsExclusiveTool(AName, LArgs) = AExpected,
+      Format('IsExclusiveTool(%s, %s) <> %s', [AName, AValue,
+        BoolToStr(AExpected, True)]));
+  finally
+    LArgs.Free;
+  end;
+end;
+
+procedure TestExclusiveToolClassification;
+begin
+  CheckExclusive('switch_database', '', '', True);
+  CheckExclusive('Pack_Table', '', '', True);
+  CheckExclusive('execute_query', '', '', False);
+  CheckExclusive('create_table', '', '', False);
+  CheckExclusive('execute_sql', 'sql', 'UPDATE t SET a = 1', False);
+  CheckExclusive('execute_sql', 'Sql', 'DELETE FROM t', False);
+  CheckExclusive('execute_sql', 'sql', 'ALTER TABLE t ADD COLUMN b INTEGER', True);
+  CheckExclusive('execute_sql', 'sql', 'DROP TABLE t', True);
+  CheckExclusive('execute_sql', 'sql', 'SELECT * INTO t2 FROM t', True);
+  CheckExclusive('execute_sql', 'sql', 'DELETE FROM t; DROP TABLE t', True);
+  CheckExclusive('batch_execute', 'statements',
+    '["INSERT INTO t VALUES (1)", "SELECT * FROM t"]', False);
+  CheckExclusive('batch_execute', 'statements',
+    '["INSERT INTO t VALUES (1)", "CREATE INDEX i ON t (a)"]', True);
+  CheckExclusive('batch_execute', 'statements', 'not json', False);
+end;
+
 begin
   try
     TestSerializationAndDiscovery;
     TestSharedToolResourceGateAndBusyShape;
     TestCapabilityFilterIsOutermost;
     TestExceptionReleasesGate;
+    TestPooledSlotsRunConcurrently;
+    TestExclusiveWaitsAndBlocksNewShared;
+    TestExclusiveTimeoutUnblocksShared;
+    TestExclusiveToolClassification;
     TestNexusErrorClassificationAndRetryCleanup;
     Writeln('PASS: serialized manager concurrency tests');
   except
