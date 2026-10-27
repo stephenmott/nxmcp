@@ -6,6 +6,17 @@ Notable changes to nxmcp.
 
 ### Added
 
+* NexusDB's process-wide fatal-error flag is now visible. Once it is set (by any critical
+  exception in the process), the first gated call logs one `[ERROR]` explaining that nxmcp
+  must be restarted; `nexusdb://server` reports `"fatal": true`; and a failed tool call whose
+  error is NexusDB's "operations are suspended" text gets a hint that the *nxmcp* service, not
+  the NexusDB server, needs restarting. In remote mode the flag only breaks some client-side
+  operations (BLOB/memo reads among them), so it previously surfaced as an occasional,
+  unexplained failure on queries returning memo columns.
+* `SerializeTools`/`SerializeResources` take an optional result filter, run on every executed
+  (not busy) call while the slot is still held.
+
+
 * NexusDB session pool (`nxmcp.SessionPool.pas`). `[Options] PoolSize` (default 4, 1..32)
   contexts, each with its own session, database, datasets and — in remote mode — its own
   transport, serve `tools/call` and `resources/read` in parallel. Previously every request
@@ -21,6 +32,8 @@ Notable changes to nxmcp.
 
 ### Changed
 
+* `EIdConnClosedGracefully` is excluded from the NexusDB exception log. Indy raises and
+  handles it on every HTTP client disconnect; it accounted for most of the log's entries.
 * `nxmodule` is now a `threadvar` bound to the serving context for the duration of each gated
   call (nil elsewhere); tool units are unchanged. The last-error text is per context.
 * The embedded `TnxServerEngine`/`TnxSqlEngine` moved out of `dmnx.dfm` into the pool and are

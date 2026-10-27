@@ -19,6 +19,7 @@ type
     FDatabaseAlias: string;
     FDatabaseAliasPath: string;
     FLastError: string;
+    FFatal: Boolean;
   public
     property Connected: Boolean read FConnected write FConnected;
     property Mode: string read FMode write FMode;
@@ -27,6 +28,8 @@ type
     property DatabaseAlias: string read FDatabaseAlias write FDatabaseAlias;
     property DatabaseAliasPath: string read FDatabaseAliasPath write FDatabaseAliasPath;
     property LastError: string read FLastError write FLastError;
+    /// <summary>NexusDB's fatal-error flag is set in this nxmcp process; restart it.</summary>
+    property Fatal: Boolean read FFatal write FFatal;
   end;
 
   /// <summary>
@@ -60,6 +63,7 @@ end;
 function TNexusDBServerResource.GetResourceData: TNexusDBServerInfo;
 begin
   Result := TNexusDBServerInfo.Create;
+  Result.Fatal := IsNexusFatal;
 
   if Assigned(nxmodule) then
   begin
@@ -70,6 +74,8 @@ begin
     Result.DatabaseAlias := nxmodule.AliasName;
     Result.DatabaseAliasPath := nxmodule.AliasPath;
     Result.LastError := nxmodule.GetLastError;
+    if Result.Fatal then
+      Result.LastError := WithFatalHint(Result.LastError);
   end
   else
   begin

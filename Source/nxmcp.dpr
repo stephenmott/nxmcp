@@ -18,6 +18,7 @@ uses
   System.SyncObjs,
   System.IniFiles,
   Winapi.Windows,
+  IdException,
   MCPServer.Types,
   MCPServer.IdHTTPServer,
   MCPServer.StdioTransport,
@@ -220,7 +221,7 @@ begin
   // listed nor callable. Everything is on unless the ini says otherwise.
   ManagerRegistry.RegisterManager(
     FilterTools(SerializeTools(TMCPToolsManager.Create, LExecutionGate,
-      Cardinal(LPrimary.BusyTimeout), IsExclusiveTool),
+      Cardinal(LPrimary.BusyTimeout), IsExclusiveTool, NexusPool.ToolResultFilter()),
       function(const AName: string): Boolean
       begin
         Result := LPrimary.IsToolEnabled(AName);
@@ -287,6 +288,12 @@ begin
   TLogger.LogToConsole := True;
   TLogger.MinLogLevel := TLogLevel.Info;
   // File logging is opt-in via [Options] LogToFile in the .ini, applied in dmnx after config load
+
+  // Indy raises EIdConnClosedGracefully on its connection thread every time an
+  // HTTP client hangs up, and catches it itself. nxExceptionHook logs every raised
+  // exception that is not excluded, so without this each disconnect adds a full
+  // stack trace to the NexusDB exception log and buries real failures.
+  ExcludeClassFromExceptionLog(EIdConnClosedGracefully);
 
   ReportMemoryLeaksOnShutdown := True;
   IsMultiThread := True;

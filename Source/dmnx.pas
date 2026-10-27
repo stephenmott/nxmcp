@@ -178,6 +178,28 @@ threadvar
   /// </summary>
   nxmodule: Tnxmodule;
 
+const
+  /// <summary>
+  /// Appended to errors while this process has NexusDB's fatal flag set. The
+  /// library's own text says "until the server is restarted", which reads as the
+  /// NexusDB server - but the flag lives in nxmcp.exe, and in remote mode
+  /// restarting the database server does not clear it.
+  /// </summary>
+  FatalHint = ' [this nxmcp.exe process has NexusDB''s fatal-error flag set ' +
+    '(see its NexusDB exception log); restart the nxmcp service to recover - ' +
+    'restarting the NexusDB server does not clear it]';
+
+/// <summary>
+/// True once NexusDB has recorded a critical failure (an access violation, invalid
+/// pointer, out-of-memory, ...) anywhere in this process. The flag is process-wide
+/// and permanent: in embedded mode every engine call then fails, in remote mode
+/// only some client-side operations do (BLOB/memo reads among them).
+/// </summary>
+function IsNexusFatal: Boolean;
+
+/// <summary>Appends FatalHint to AMessage while IsNexusFatal (once).</summary>
+function WithFatalHint(const AMessage: string): string;
+
 implementation
 
 uses
@@ -199,20 +221,16 @@ uses
 
 {$R *.dfm}
 
-/// <summary>
-/// Append a restart hint when the in-process engine is in the unrecoverable
-/// fatal state. The library's own rsFatalError text says "until the server is
-/// restarted", which for embedded mode means this very process - spell that out
-/// so an MCP client (or the AI driving it) knows reconnecting cannot help.
-/// </summary>
+function IsNexusFatal: Boolean;
+begin
+  Result := _FatalException;
+end;
+
 function WithFatalHint(const AMessage: string): string;
-const
-  cHint = ' [the in-process NexusDB engine reported a fatal error and is ' +
-          'suspended; nxmcp.exe must be restarted to recover]';
 begin
   Result := AMessage;
-  if _FatalException and (Pos(cHint, Result) = 0) then
-    Result := Result + cHint;
+  if _FatalException and (Pos(FatalHint, Result) = 0) then
+    Result := Result + FatalHint;
 end;
 
 procedure Tnxmodule.DataModuleCreate(Sender: TObject);

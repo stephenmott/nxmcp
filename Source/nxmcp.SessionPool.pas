@@ -4,6 +4,7 @@ interface
 
 uses
   System.SysUtils,
+  System.Rtti,
   System.Generics.Collections,
   nxsrServerEngine,
   nxsqlEngine,
@@ -32,11 +33,14 @@ type
     FGate: INxExecutionGate;
     FLogLock: TObject;
     FLastQueryLog: TArray<string>;
+    FFatalReported: Integer;
     procedure EnterSlot(ASlot: Integer; AExclusive: Boolean);
     procedure LeaveSlot(ASlot: Integer; AExclusive: Boolean);
     procedure PrepareExclusive(AActing: Tnxmodule);
     procedure SyncAfterExclusive(AActing: Tnxmodule);
     procedure PublishQueryLog(AModule: Tnxmodule);
+    procedure ReportFatalOnce;
+    procedure AddFatalHint(const AResult: TValue);
     function GetPrimary: Tnxmodule;
     function GetSize: Integer;
   public
@@ -50,6 +54,12 @@ type
     /// </summary>
     property Primary: Tnxmodule read GetPrimary;
     property Gate: INxExecutionGate read FGate;
+    /// <summary>
+    /// Result filter for the tools manager: appends FatalHint to a failed call's
+    /// text when the failure is NexusDB's "operations are suspended" error and the
+    /// flag is set in this process (rather than in the NexusDB server).
+    /// </summary>
+    function ToolResultFilter: TNxResultFilter;
     property Size: Integer read GetSize;
   end;
 
@@ -60,6 +70,9 @@ implementation
 
 uses
   System.Classes,
+  System.SyncObjs,
+  System.JSON,
+  nxllException,
   MCPServer.Logger;
 
 threadvar
@@ -107,6 +120,7 @@ begin
     end);
 
   TLogger.Info(Format('NexusDB session pool: %d session(s).', [FModules.Count]));
+  ReportFatalOnce;
 end;
 
 destructor TnxSessionPool.Destroy;
@@ -142,6 +156,7 @@ procedure TnxSessionPool.EnterSlot(ASlot: Integer; AExclusive: Boolean);
 var
   LModule: Tnxmodule;
 begin
+  ReportFatalOnce;
   LModule := FModules[ASlot];
   GPreviousModule := nxmodule;
   nxmodule := LModule;
@@ -224,6 +239,58 @@ begin
   finally
     TMonitor.Exit(FLogLock);
   end;
+end;
+
+procedure TnxSessionPool.ReportFatalOnce;
+begin
+  // The flag can be set at any time by any thread (e.g. a NexusDB background
+  // thread shortly after startup), so this is checked on every gated call, not
+  // just at startup - but reported once.
+  if IsNexusFatal and (TInterlocked.CompareExchange(FFatalReported, 1, 0) = 0) then
+    TLogger.Error('NexusDB''s fatal-error flag is set in this process: BLOB/memo ' +
+      'reads (and in embedded mode every engine call) now fail with "operations are ' +
+      'suspended". Restart the nxmcp service to clear it. The cause is the first ' +
+      'entry without a "Server suspended" line in the NexusDB exception log.');
+end;
+
+procedure TnxSessionPool.AddFatalHint(const AResult: TValue);
+var
+  LContent: TJSONValue;
+  LError: TJSONValue;
+  LItem: TJSONValue;
+  LObject: TJSONObject;
+  LText: string;
+begin
+  if not IsNexusFatal or AResult.IsEmpty or not AResult.IsType<TJSONObject> then
+    Exit;
+  LObject := AResult.AsType<TJSONObject>;
+  LError := LObject.GetValue('isError');
+  if not ((LError is TJSONBool) and TJSONBool(LError).AsBoolean) then
+    Exit;
+  LContent := LObject.GetValue('content');
+  if not (LContent is TJSONArray) then
+    Exit;
+  for LItem in TJSONArray(LContent) do
+    if (LItem is TJSONObject) and (TJSONObject(LItem).GetValue('text') is TJSONString) then
+    begin
+      LText := TJSONObject(LItem).GetValue('text').Value;
+      // Only the suspended error itself: an ordinary SQL error is unrelated, and
+      // the same text without our local flag set comes from the NexusDB server,
+      // where restarting the server is the right advice.
+      if Pos(rsFatalError, LText) = 0 then
+        Continue;
+      TJSONObject(LItem).RemovePair('text').Free;
+      TJSONObject(LItem).AddPair('text', WithFatalHint(LText));
+    end;
+end;
+
+function TnxSessionPool.ToolResultFilter: TNxResultFilter;
+begin
+  Result :=
+    procedure(const AResult: TValue)
+    begin
+      AddFatalHint(AResult);
+    end;
 end;
 
 end.

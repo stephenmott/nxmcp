@@ -4,6 +4,7 @@ interface
 
 uses
   System.JSON,
+  System.Rtti,
   MCPServer.Types;
 
 type
@@ -20,6 +21,12 @@ type
   /// </summary>
   TNxExclusivePredicate = reference to function(const AName: string;
     const AArguments: TJSONObject): Boolean;
+
+  /// <summary>
+  /// Inspects (and may amend in place) the result a gated call produced, before
+  /// it is returned. Not called for busy results.
+  /// </summary>
+  TNxResultFilter = reference to procedure(const AResult: TValue);
 
   /// <summary>
   /// One execution gate is shared by the tools and resources managers because
@@ -43,17 +50,18 @@ function CreateExecutionGate(ASlotCount: Integer = 1;
 
 function SerializeTools(const AInner: IMCPCapabilityManager;
   const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal;
-  const AIsExclusive: TNxExclusivePredicate = nil): IMCPCapabilityManager;
+  const AIsExclusive: TNxExclusivePredicate = nil;
+  const AResultFilter: TNxResultFilter = nil): IMCPCapabilityManager;
 
 function SerializeResources(const AInner: IMCPCapabilityManager;
-  const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal): IMCPCapabilityManager;
+  const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal;
+  const AResultFilter: TNxResultFilter = nil): IMCPCapabilityManager;
 
 implementation
 
 uses
   System.SysUtils,
   System.StrUtils,
-  System.Rtti,
   System.Diagnostics,
   System.Generics.Collections,
   MCPServer.Logger;
@@ -93,6 +101,7 @@ type
     FBusyTimeoutMs: Cardinal;
     FKind: TnxManagerKind;
     FIsExclusive: TNxExclusivePredicate;
+    FResultFilter: TNxResultFilter;
     FInvokeMethod: string;
     FInvokeParamKey: string;
     function SafeOperationValue(const AValue: string): string;
@@ -107,7 +116,8 @@ type
   public
     constructor Create(const AInner: IMCPCapabilityManager;
       const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal;
-      AKind: TnxManagerKind; const AIsExclusive: TNxExclusivePredicate);
+      AKind: TnxManagerKind; const AIsExclusive: TNxExclusivePredicate;
+      const AResultFilter: TNxResultFilter);
     function GetCapabilityName: string;
     function HandlesMethod(const Method: string): Boolean;
     function ExecuteMethod(const Method: string;
@@ -122,17 +132,19 @@ end;
 
 function SerializeTools(const AInner: IMCPCapabilityManager;
   const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal;
-  const AIsExclusive: TNxExclusivePredicate): IMCPCapabilityManager;
+  const AIsExclusive: TNxExclusivePredicate;
+  const AResultFilter: TNxResultFilter): IMCPCapabilityManager;
 begin
   Result := TnxSerializedManager.Create(AInner, AGate, ABusyTimeoutMs, mkTools,
-    AIsExclusive);
+    AIsExclusive, AResultFilter);
 end;
 
 function SerializeResources(const AInner: IMCPCapabilityManager;
-  const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal): IMCPCapabilityManager;
+  const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal;
+  const AResultFilter: TNxResultFilter): IMCPCapabilityManager;
 begin
   Result := TnxSerializedManager.Create(AInner, AGate, ABusyTimeoutMs,
-    mkResources, nil);
+    mkResources, nil, AResultFilter);
 end;
 
 { TnxExecutionGate }
@@ -290,7 +302,8 @@ end;
 
 constructor TnxSerializedManager.Create(const AInner: IMCPCapabilityManager;
   const AGate: INxExecutionGate; ABusyTimeoutMs: Cardinal;
-  AKind: TnxManagerKind; const AIsExclusive: TNxExclusivePredicate);
+  AKind: TnxManagerKind; const AIsExclusive: TNxExclusivePredicate;
+  const AResultFilter: TNxResultFilter);
 begin
   inherited Create;
   if not Assigned(AInner) then
@@ -303,6 +316,7 @@ begin
   FBusyTimeoutMs := ABusyTimeoutMs;
   FKind := AKind;
   FIsExclusive := AIsExclusive;
+  FResultFilter := AResultFilter;
   case FKind of
     mkTools:
       begin
@@ -480,6 +494,8 @@ begin
        LStopwatch.ElapsedMilliseconds]));
   try
     Result := FInner.ExecuteMethod(Method, Params);
+    if Assigned(FResultFilter) then
+      FResultFilter(Result);
   finally
     FGate.Leave(LSlot);
   end;

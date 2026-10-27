@@ -715,6 +715,39 @@ begin
   end;
 end;
 
+procedure TestResultFilterSkipsBusyResults;
+var
+  LFakeObject: TFakeManager;
+  LFake: IMCPCapabilityManager;
+  LGate: INxExecutionGate;
+  LManager: IMCPCapabilityManager;
+  LHolder: TThread;
+  LFiltered: Integer;
+begin
+  LFiltered := 0;
+  LGate := CreateExecutionGate(1);
+  LFakeObject := TFakeManager.Create('tools/call');
+  LFake := LFakeObject;
+  LManager := SerializeTools(LFake, LGate, 50, nil,
+    procedure(const AResult: TValue)
+    begin
+      TInterlocked.Increment(LFiltered);
+    end);
+
+  Check(not CallIsBusy(LManager, 'plain'), 'plain call failed');
+  Check(LFiltered = 1, 'result filter did not see an executed call');
+
+  LFakeObject.ResetEvents;
+  LFakeObject.BlockInvocations;
+  LHolder := StartToolCall(LManager, 'holder');
+  Check(LFakeObject.Entered.WaitFor(1000) = wrSignaled, 'holder did not enter');
+  Check(CallIsBusy(LManager, 'contender'), 'contender was not refused as busy');
+  LFakeObject.ReleaseInvocations;
+  LHolder.WaitFor;
+  LHolder.Free;
+  Check(LFiltered = 2, 'result filter ran for a busy result, or missed the holder');
+end;
+
 procedure TestExclusiveToolClassification;
 begin
   CheckExclusive('switch_database', '', '', True);
@@ -743,6 +776,7 @@ begin
     TestPooledSlotsRunConcurrently;
     TestExclusiveWaitsAndBlocksNewShared;
     TestExclusiveTimeoutUnblocksShared;
+    TestResultFilterSkipsBusyResults;
     TestExclusiveToolClassification;
     TestNexusErrorClassificationAndRetryCleanup;
     Writeln('PASS: serialized manager concurrency tests');
