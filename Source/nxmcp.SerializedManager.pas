@@ -94,7 +94,8 @@ type
     function SlotCount: Integer;
   end;
 
-  TnxSerializedManager = class(TInterfacedObject, IMCPCapabilityManager)
+  TnxSerializedManager = class(TInterfacedObject, IMCPCapabilityManager,
+    IMCPCapabilityProvider)
   private
     FInner: IMCPCapabilityManager;
     FGate: INxExecutionGate;
@@ -122,6 +123,8 @@ type
     function HandlesMethod(const Method: string): Boolean;
     function ExecuteMethod(const Method: string;
       const Params: TJSONObject): TValue;
+    // Not gated: describing capabilities touches no NexusDB session.
+    procedure DescribeCapabilities(const Capabilities: TJSONObject; Era: TMCPProtocolEra);
   end;
 
 function CreateExecutionGate(ASlotCount: Integer;
@@ -339,6 +342,15 @@ end;
 function TnxSerializedManager.HandlesMethod(const Method: string): Boolean;
 begin
   Result := FInner.HandlesMethod(Method);
+end;
+
+procedure TnxSerializedManager.DescribeCapabilities(const Capabilities: TJSONObject;
+  Era: TMCPProtocolEra);
+var
+  LProvider: IMCPCapabilityProvider;
+begin
+  if Supports(FInner, IMCPCapabilityProvider, LProvider) then
+    LProvider.DescribeCapabilities(Capabilities, Era);
 end;
 
 function TnxSerializedManager.InvokedName(const Params: TJSONObject): string;

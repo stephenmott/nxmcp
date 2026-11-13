@@ -202,6 +202,18 @@ begin
   end;
 end;
 
+function IniHasKey(const APath, ASection, AKey: string): Boolean;
+var
+  LIniFile: TIniFile;
+begin
+  LIniFile := TIniFile.Create(APath);
+  try
+    Result := LIniFile.ValueExists(ASection, AKey);
+  finally
+    LIniFile.Free;
+  end;
+end;
+
 procedure CreateManagerRegistry;
 var
   LPrimary: Tnxmodule;
@@ -212,6 +224,12 @@ begin
   // (immutable after startup) configuration from the primary context directly.
   LPrimary := NexusPool.Primary;
   Settings := TMCPSettings.Create(LPrimary.GetConfigPath);
+  // The MCP library listens on loopback only when [Server] Host=localhost and no
+  // BindAddress is set. nxmcp has always listened on every interface - it is
+  // reached through a reverse proxy on another machine - so keep doing that
+  // unless the ini names an address. An explicit BindAddress always wins.
+  if not IniHasKey(LPrimary.GetConfigPath, 'Server', 'BindAddress') then
+    Settings.BindAddress := '0.0.0.0';
   ManagerRegistry := TMCPManagerRegistry.Create;
   CoreManager := TMCPCoreManager.Create(Settings);
   ManagerRegistry.RegisterManager(CoreManager);
